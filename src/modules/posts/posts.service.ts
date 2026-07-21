@@ -1,0 +1,828 @@
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  InternalServerErrorException,
+  NotFoundException,
+} from "@nestjs/common";
+import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
+import { QueuesService } from "../queues/queues.service";
+// Ported plain-JS integrations (allowJs). Types resolve to `any`.
+import {
+  scheduleFacebookPost,
+  publishFacebookPost,
+  postFacebookComment,
+  updateScheduledFacebookPost,
+  checkFacebookPostStatus,
+  publishUnpublishedFacebookPost,
+} from "../../lib/facebook";
+import { publishInstagramPost, postInstagramComment, checkInstagramPostStatus } from "../../lib/instagram";
+import { publishThreadsPost, postThreadsReply, checkThreadsPostStatus } from "../../lib/threads";
+import { publishXPost, postXReply, checkXPostStatus } from "../../lib/x";
+import { publishYouTubeVideo, checkYouTubeVideoStatus } from "../../lib/youtube";
+import { logActivity } from "../../lib/activity";
+import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
+import { runCompliance } from "../../lib/compliance";
+
+// Facebook's native scheduler only accepts times 10 min – 30 days out.
+// Anything sooner than 10 min (or in the past) we just publish immediately.
+const INSTANT_WINDOW_MS = 10 * 60 * 1000;
+const MAX_SCHEDULE_MS = 30 * 24 * 60 * 60 * 1000;
+
+@Injectable()
+export class PostsService {
+  constructor(
+    private readonly supabaseService: SupabaseService,
+    private readonly queuesService: QueuesService,
+  ) {}
+
+  async list() {
+    const supabase = this.supabaseService.createServiceClient();
+
+    const [{ data: accounts, error: accountsError }, { data: posts, error: postsError }, { data: authors }] =
+      await Promise.all([
+        supabase
+          .from("social_accounts")
+          .select("*")
+          .eq("user_id", OWNER_ID)
+          .order("created_at", { ascending: false }),
+        supabase
+          .from("scheduled_posts")
+          .select("*, post_targets(*, social_accounts(id, display_name, platform, avatar_url))")
+          .eq("user_id", OWNER_ID)
+          .order("scheduled_for", { ascending: false })
+          .limit(100),
+        supabase.from("profiles").select("id, display_name, email, division_id"),
+      ]);
+
+    if (accountsError || postsError) {
+      throw new InternalServerErrorException(accountsError?.message || postsError?.message);
+    }
+
+    return { accounts, posts, authors: authors || [] };
+  }
+
+  async create(payload: any, author: any) {
+    const supabase = this.supabaseService.createServiceClient();
+
+    const {
+      body,
+      imageUrl,
+      media,
+      linkUrl,
+      scheduledFor,
+      socialAccountIds,
+      contentType,
+      templateId,
+      firstComment,
+      saveAs,
+    } = payload || {};
+    const accountIds = Array.isArray(socialAccountIds) ? socialAccountIds : [];
+
+    // Ordered media list [{url, type: "image"|"video"}]. imageUrl is the
+    // legacy single-image field — fold it in so older clients keep working.
+    const mediaList = (Array.isArray(media) ? media : [])
+      .filter((m: any) => m?.url)
+      .map((m: any) => ({ url: m.url, type: m.type === "video" ? "video" : "image" }));
+    if (!mediaList.length && imageUrl) mediaList.push({ url: imageUrl, type: "image" });
+    // First image doubles as the thumbnail in calendar/queue cards.
+    const firstImage = mediaList.find((m) => m.type === "image")?.url || null;
+
+    // Draft / submit-for-review: store without publishing or scheduling on Facebook.
+    if (saveAs === "draft" || saveAs === "review") {
+      if (!body?.trim() || !accountIds.length) {
+        throw new BadRequestException("Post text and at least one Page are required.");
+      }
+      const status = saveAs === "review" ? "pending_review" : "draft";
+      const { data: dPost, error: dErr } = await supabase
+        .from("scheduled_posts")
+        .insert({
+          user_id: OWNER_ID,
+          body: body.trim(),
+          image_url: firstImage,
+          media: mediaList.length ? mediaList : null,
+          link_url: linkUrl || null,
+          scheduled_for: scheduledFor ? new Date(scheduledFor).toISOString() : new Date().toISOString(),
+          status,
+          approval_status: saveAs === "review" ? "pending" : "none",
+          content_type: contentType || null,
+          template_id: templateId || null,
+          first_comment: firstComment || null,
+          created_by: author?.id || null,
+        })
+        .select()
+        .single();
+      if (dErr) throw new InternalServerErrorException(dErr.message);
+
+      const { data: accts } = await supabase
+        .from("social_accounts")
+        .select("id,platform")
+        .in("id", accountIds)
+        .eq("user_id", OWNER_ID);
+      if (accts?.length) {
+        await supabase
+          .from("post_targets")
+          .insert(accts.map((a) => ({ post_id: dPost.id, social_account_id: a.id, platform: a.platform, status })));
+      }
+      await logActivity({
+        type: saveAs === "review" ? "post.submitted" : "post.draft",
+        title: saveAs === "review" ? "Submitted a post for review" : "Saved a draft",
+        status: "info",
+        meta: { postId: dPost.id },
+      });
+      return { post: dPost, saved: saveAs };
+    }
+
+    // "Add to queue": resolve the next open posting slot for the selected
+    // accounts and schedule into it — no explicit time needed.
+    let effectiveScheduledFor = scheduledFor;
+    if (saveAs === "queue") {
+      if (!body?.trim() || !accountIds.length) {
+        throw new BadRequestException("Post text and at least one Page are required.");
+      }
+      effectiveScheduledFor = await this.queuesService.nextOpenSlot(accountIds);
+    }
+
+    if (!body?.trim() || !effectiveScheduledFor || !accountIds.length) {
+      throw new BadRequestException("Post text, schedule time, and at least one Page are required.");
+    }
+
+    const scheduledDate = new Date(effectiveScheduledFor);
+    if (Number.isNaN(scheduledDate.getTime())) {
+      throw new BadRequestException("Invalid schedule time.");
+    }
+
+    const diffMs = scheduledDate.getTime() - Date.now();
+    if (diffMs > MAX_SCHEDULE_MS) {
+      throw new BadRequestException("Facebook can only schedule up to 30 days ahead.");
+    }
+
+    // Within 10 minutes (or in the past) → publish immediately instead of scheduling.
+    const publishNow = diffMs <= INSTANT_WINDOW_MS;
+    const initialStatus = publishNow ? "publishing" : "scheduled";
+
+    const { data: accounts, error: accountsError } = await supabase
+      .from("social_accounts")
+      .select("*")
+      .in("id", accountIds)
+      .eq("user_id", OWNER_ID);
+
+    if (accountsError || !accounts?.length) {
+      throw new NotFoundException("Selected accounts were not found.");
+    }
+
+    // Instagram cannot publish text-only posts — catch it up front instead of
+    // failing per-target at publish time.
+    if (!mediaList.length && accounts.some((a) => a.platform === "instagram")) {
+      throw new BadRequestException("Instagram posts require an image or video — attach media or deselect the Instagram account.");
+    }
+    if (!mediaList.some((m) => m.type === "video") && accounts.some((a) => a.platform === "youtube")) {
+      throw new BadRequestException("YouTube posts require a video — attach one or deselect the YouTube channel.");
+    }
+
+    // Compliance is advisory only — flags are shown in the UI but never block
+    // posting or scheduling. This is intentional during the iterative rollout.
+    runCompliance({ body, linkUrl, imageUrl: firstImage, contentType, accounts });
+
+    const { data: post, error: postError } = await supabase
+      .from("scheduled_posts")
+      .insert({
+        user_id: OWNER_ID,
+        body: body.trim(),
+        image_url: firstImage,
+        media: mediaList.length ? mediaList : null,
+        link_url: linkUrl || null,
+        content_type: contentType || null,
+        template_id: templateId || null,
+        first_comment: firstComment || null,
+        created_by: author?.id || null,
+        scheduled_for: (publishNow ? new Date() : scheduledDate).toISOString(),
+        status: initialStatus,
+      })
+      .select()
+      .single();
+
+    if (postError) throw new InternalServerErrorException(postError.message);
+
+    // UTM click tracking (opt-in via Settings): tag the outbound link once,
+    // then persist so the stored post matches what actually went out.
+    let outboundLink = linkUrl || null;
+    if (outboundLink && (await utmTrackingEnabled())) {
+      outboundLink = appendUtm(outboundLink, { postId: post.id });
+      await supabase.from("scheduled_posts").update({ link_url: outboundLink }).eq("id", post.id);
+    }
+
+    const results: any[] = [];
+
+    for (const account of accounts) {
+      const { error: targetError } = await supabase.from("post_targets").insert({
+        post_id: post.id,
+        social_account_id: account.id,
+        platform: account.platform,
+        status: initialStatus,
+      });
+
+      if (targetError) {
+        results.push({ accountId: account.id, status: "failed", error: targetError.message });
+        continue;
+      }
+
+      try {
+        const postData = { ...post, link_url: outboundLink };
+        let result, targetStatus, sentAt = null;
+
+        if (["instagram", "threads", "twitter"].includes(account.platform) && !publishNow) {
+          // These platforms have no native scheduling — leave the target
+          // queued; /api/cron/publish sends it when the scheduled time arrives.
+          results.push({ accountId: account.id, name: account.display_name, status: "scheduled", queued: true });
+          continue;
+        }
+
+        if (account.platform === "youtube") {
+          // Real end-to-end upload. For future posts YouTube's NATIVE
+          // scheduling is used: the video uploads now as private with
+          // status.publishAt and goes public at the scheduled time.
+          result = await publishYouTubeVideo({
+            account,
+            post: postData,
+            scheduledFor: publishNow ? null : effectiveScheduledFor,
+          });
+          targetStatus = publishNow ? "sent" : "scheduled";
+          if (publishNow) sentAt = new Date().toISOString();
+        } else if (account.platform === "twitter") {
+          result = await publishXPost({ account, post: postData });
+          targetStatus = "sent";
+          sentAt = new Date().toISOString();
+        } else if (account.platform === "instagram") {
+          result = await publishInstagramPost({ account, post: postData });
+          targetStatus = "sent";
+          sentAt = new Date().toISOString();
+        } else if (account.platform === "threads") {
+          result = await publishThreadsPost({ account, post: postData });
+          targetStatus = "sent";
+          sentAt = new Date().toISOString();
+        } else if (publishNow) {
+          result = await publishFacebookPost({ account, post: postData });
+          targetStatus = "sent";
+          sentAt = new Date().toISOString();
+        } else {
+          result = await scheduleFacebookPost({ account, post: postData, scheduledFor: effectiveScheduledFor });
+          targetStatus = "scheduled";
+        }
+
+        await supabase
+          .from("post_targets")
+          .update({ status: targetStatus, external_post_id: result.externalPostId, sent_at: sentAt })
+          .eq("post_id", post.id)
+          .eq("social_account_id", account.id);
+
+        // Best-effort first comment — only possible once a post is actually live
+        // (immediate publish). A native-scheduler post can't get one from here
+        // since this route isn't invoked again when Facebook publishes it later.
+        if (targetStatus === "sent" && firstComment?.trim() && result.externalPostId) {
+          try {
+            if (account.platform === "instagram") {
+              await postInstagramComment({ account, mediaId: result.externalPostId, message: firstComment });
+            } else if (account.platform === "threads") {
+              await postThreadsReply({ account, mediaId: result.externalPostId, message: firstComment });
+            } else if (account.platform === "twitter") {
+              await postXReply({ account, tweetId: result.externalPostId, message: firstComment });
+            } else if (account.platform !== "youtube") {
+              await postFacebookComment({ account, postId: result.externalPostId, message: firstComment });
+            }
+          } catch (commentError) {
+            console.warn(`[posts] first comment failed for ${account.display_name}:`, commentError.message);
+          }
+        }
+
+        results.push({
+          accountId: account.id,
+          name: account.display_name,
+          status: targetStatus,
+          externalPostId: result.externalPostId,
+        });
+      } catch (err) {
+        await supabase
+          .from("post_targets")
+          .update({ status: "failed", last_error: err.message })
+          .eq("post_id", post.id)
+          .eq("social_account_id", account.id);
+
+        results.push({ accountId: account.id, name: account.display_name, status: "failed", error: err.message });
+      }
+    }
+
+    const allFailed = results.every((r) => r.status === "failed");
+    const anyFailed = results.some((r) => r.status === "failed");
+    const allSent = publishNow && results.every((r) => r.status === "sent");
+
+    const finalStatus = allFailed ? "failed" : publishNow ? "sent" : "scheduled";
+    await supabase
+      .from("scheduled_posts")
+      .update({ status: finalStatus, sent_at: allSent ? new Date().toISOString() : null })
+      .eq("id", post.id);
+
+    await logActivity({
+      type: allFailed ? "post.failed" : publishNow ? "post.published" : "post.scheduled",
+      title: allFailed
+        ? `Post failed on all pages`
+        : publishNow
+          ? `Published to ${results.filter((r) => r.status === "sent").length} page(s)`
+          : `Scheduled to ${results.filter((r) => r.status === "scheduled").length} page(s)`,
+      status: allFailed ? "error" : anyFailed ? "warning" : "success",
+      meta: { postId: post.id, results: results.map((r) => ({ name: r.name, status: r.status })) },
+    });
+
+    return {
+      post,
+      results,
+      publishedNow: publishNow,
+      warning: anyFailed && !allFailed ? "Some pages failed." : null,
+    };
+  }
+
+  // PATCH /api/posts/:id — edit caption / link / schedule time.
+  async update(id: string, payload: any) {
+    const supabase = this.supabaseService.createServiceClient();
+    const { body, linkUrl, scheduledFor } = payload || {};
+
+    const { data: post } = await supabase
+      .from("scheduled_posts")
+      .select("*, post_targets(*, social_accounts(*))")
+      .eq("id", id)
+      .eq("user_id", OWNER_ID)
+      .single();
+
+    if (!post) throw new NotFoundException("Post not found.");
+    if (post.status === "sent" || post.status === "publishing") {
+      throw new ConflictException("Only scheduled or failed posts can be edited.");
+    }
+    if (body !== undefined && !body.trim()) {
+      throw new BadRequestException("Caption can't be empty.");
+    }
+
+    const warnings: string[] = [];
+    for (const target of post.post_targets || []) {
+      if (target.status === "scheduled" && target.platform === "facebook" && target.external_post_id) {
+        try {
+          await updateScheduledFacebookPost({
+            account: target.social_accounts,
+            externalPostId: target.external_post_id,
+            message: body !== undefined ? body.trim() : undefined,
+            scheduledFor: scheduledFor || undefined,
+          });
+        } catch (e) {
+          warnings.push(`${target.social_accounts?.display_name || "Page"}: ${e.message}`);
+        }
+      }
+    }
+
+    const update: any = {};
+    if (body !== undefined) update.body = body.trim();
+    if (linkUrl !== undefined) update.link_url = linkUrl || null;
+    if (scheduledFor) update.scheduled_for = new Date(scheduledFor).toISOString();
+
+    const { data: updated, error } = await supabase
+      .from("scheduled_posts")
+      .update(update)
+      .eq("id", id)
+      .eq("user_id", OWNER_ID)
+      .select("*, post_targets(*, social_accounts(id, display_name, platform, avatar_url))")
+      .single();
+
+    if (error) throw new InternalServerErrorException(error.message);
+    return { post: updated, warnings: warnings.length ? warnings.join("; ") : null };
+  }
+
+  // DELETE /api/posts/:id
+  async remove(id: string) {
+    const supabase = this.supabaseService.createServiceClient();
+
+    const { data: post } = await supabase
+      .from("scheduled_posts")
+      .select("id, status")
+      .eq("id", id)
+      .eq("user_id", OWNER_ID)
+      .single();
+
+    if (!post) throw new NotFoundException("Post not found.");
+    if (post.status === "publishing") {
+      throw new ConflictException("Cannot delete a post that is currently publishing.");
+    }
+
+    const { error: deleteError } = await supabase
+      .from("scheduled_posts")
+      .delete()
+      .eq("id", id)
+      .eq("user_id", OWNER_ID);
+
+    if (deleteError) throw new InternalServerErrorException(deleteError.message);
+    return { ok: true };
+  }
+
+  // POST /api/posts/bulk — delete or reschedule many at once.
+  async bulk(payload: any) {
+    const supabase = this.supabaseService.createServiceClient();
+    const { action, ids, scheduledFor } = payload || {};
+
+    if (!Array.isArray(ids) || !ids.length) {
+      throw new BadRequestException("No posts selected.");
+    }
+
+    const { data: posts, error: fetchError } = await supabase
+      .from("scheduled_posts")
+      .select("*, post_targets(*, social_accounts(*))")
+      .in("id", ids)
+      .eq("user_id", OWNER_ID);
+
+    if (fetchError) throw new InternalServerErrorException(fetchError.message);
+
+    const eligible = (posts || []).filter((p) => p.status !== "publishing" && p.status !== "sent");
+    const skipped = (posts || []).length - eligible.length;
+
+    if (action === "delete") {
+      const eligibleIds = eligible.map((p) => p.id);
+      if (eligibleIds.length) {
+        const { error } = await supabase
+          .from("scheduled_posts")
+          .delete()
+          .in("id", eligibleIds)
+          .eq("user_id", OWNER_ID);
+        if (error) throw new InternalServerErrorException(error.message);
+      }
+      await logActivity({ type: "post.bulk_deleted", title: `Deleted ${eligibleIds.length} post(s)`, status: "info" });
+      return { ok: true, affected: eligible.length, skipped };
+    }
+
+    if (action === "reschedule") {
+      if (!scheduledFor) throw new BadRequestException("scheduledFor is required.");
+      const newDate = new Date(scheduledFor);
+      if (Number.isNaN(newDate.getTime())) throw new BadRequestException("Invalid date.");
+
+      let affected = 0;
+      for (const post of eligible) {
+        for (const target of post.post_targets || []) {
+          if (target.status === "scheduled" && target.platform === "facebook" && target.external_post_id) {
+            try {
+              await updateScheduledFacebookPost({
+                account: target.social_accounts,
+                externalPostId: target.external_post_id,
+                scheduledFor: newDate,
+              } as any);
+            } catch (e) {
+              console.warn(`[posts/bulk] reschedule push failed for ${post.id}:`, e.message);
+            }
+          }
+        }
+        const { error } = await supabase
+          .from("scheduled_posts")
+          .update({ scheduled_for: newDate.toISOString() })
+          .eq("id", post.id)
+          .eq("user_id", OWNER_ID);
+        if (!error) affected++;
+      }
+      await logActivity({ type: "post.bulk_rescheduled", title: `Rescheduled ${affected} post(s)`, status: "info" });
+      return { ok: true, affected, skipped };
+    }
+
+    throw new BadRequestException("Unknown action.");
+  }
+
+  // POST /api/posts/recycle — clone a post back into the queue.
+  async recycle(payload: any, author: any) {
+    const supabase = this.supabaseService.createServiceClient();
+
+    const { postId, scheduledFor } = payload || {};
+    if (!postId) throw new BadRequestException("postId is required.");
+
+    const { data: post, error } = await supabase
+      .from("scheduled_posts")
+      .select("*, post_targets(social_account_id, platform)")
+      .eq("id", postId)
+      .eq("user_id", OWNER_ID)
+      .maybeSingle();
+    if (error) throw new InternalServerErrorException(error.message);
+    if (!post) throw new NotFoundException("Post not found.");
+
+    let when = scheduledFor ? new Date(scheduledFor) : new Date(new Date(post.scheduled_for).getTime());
+    if (!scheduledFor) {
+      when = new Date(post.scheduled_for);
+      when.setFullYear(new Date().getFullYear(), new Date().getMonth(), new Date().getDate() + 1);
+    }
+    if (Number.isNaN(when.getTime())) throw new BadRequestException("Invalid schedule time.");
+    if (when.getTime() < Date.now() + 5 * 60 * 1000) {
+      throw new BadRequestException("Recycle time must be at least 5 minutes from now.");
+    }
+
+    const { data: clone, error: cloneError } = await supabase
+      .from("scheduled_posts")
+      .insert({
+        user_id: OWNER_ID,
+        body: post.body,
+        image_url: post.image_url,
+        media: post.media || null,
+        link_url: post.link_url,
+        first_comment: post.first_comment,
+        template_id: post.template_id,
+        scheduled_for: when.toISOString(),
+        status: "scheduled",
+        created_by: author?.id || null,
+      })
+      .select()
+      .single();
+    if (cloneError) throw new InternalServerErrorException(cloneError.message);
+
+    const targets = (post.post_targets || []).map((t) => ({
+      post_id: clone.id,
+      social_account_id: t.social_account_id,
+      platform: t.platform,
+      status: "scheduled",
+    }));
+    if (targets.length) {
+      const { error: targetError } = await supabase.from("post_targets").insert(targets);
+      if (targetError) {
+        await supabase.from("scheduled_posts").delete().eq("id", clone.id);
+        throw new InternalServerErrorException(targetError.message);
+      }
+    }
+
+    await logActivity({
+      type: "post.recycled",
+      title: `Recycled a post for ${when.toLocaleString()}`,
+      status: "info",
+      meta: { sourcePostId: post.id, newPostId: clone.id },
+    });
+    return { post: clone };
+  }
+
+  // POST /api/posts/import — bulk CSV import (rows parsed client-side).
+  async importCsv(payload: any, author: any) {
+    const supabase = this.supabaseService.createServiceClient();
+    const MAX_ROWS = 200;
+    const CONTENT_TYPES = new Set(["infographic", "meme_image", "lic"]);
+
+    const { rows } = payload || {};
+    if (!Array.isArray(rows) || !rows.length) {
+      throw new BadRequestException("No rows to import.");
+    }
+    if (rows.length > MAX_ROWS) {
+      throw new BadRequestException(`Too many rows — max ${MAX_ROWS} per import.`);
+    }
+
+    const { data: accounts, error: acctError } = await supabase
+      .from("social_accounts")
+      .select("id, platform, display_name")
+      .eq("user_id", OWNER_ID);
+    if (acctError) throw new InternalServerErrorException(acctError.message);
+    const byName = new Map((accounts || []).map((a) => [a.display_name.trim().toLowerCase(), a]));
+
+    let created = 0;
+    const errors: any[] = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i] || {};
+      const rowNum = i + 2;
+
+      const text = (row.text || "").trim();
+      if (!text) {
+        errors.push({ row: rowNum, error: "Missing post text." });
+        continue;
+      }
+
+      const when = new Date(row.scheduledFor);
+      if (!row.scheduledFor || Number.isNaN(when.getTime())) {
+        errors.push({ row: rowNum, error: "Invalid or missing schedule date/time." });
+        continue;
+      }
+
+      const pagesField = (row.pages || "").trim();
+      let targets;
+      if (!pagesField || pagesField.toLowerCase() === "all") {
+        targets = accounts || [];
+      } else {
+        targets = [];
+        const misses: string[] = [];
+        for (const name of pagesField.split(/[;,]/).map((s) => s.trim()).filter(Boolean)) {
+          const acct = byName.get(name.toLowerCase());
+          if (acct) targets.push(acct);
+          else misses.push(name);
+        }
+        if (misses.length) {
+          errors.push({ row: rowNum, error: `Unknown page(s): ${misses.join(", ")}` });
+          continue;
+        }
+      }
+      if (!targets.length) {
+        errors.push({ row: rowNum, error: "No pages matched." });
+        continue;
+      }
+
+      const contentTypeRaw = (row.contentType || "").trim().toLowerCase();
+      if (contentTypeRaw && !CONTENT_TYPES.has(contentTypeRaw)) {
+        errors.push({
+          row: rowNum,
+          error: `Invalid content_type "${row.contentType}" — use infographic, meme_image, lic, or leave blank.`,
+        });
+        continue;
+      }
+
+      // CSV rows carry a single imageUrl and/or videoUrl — fold into media.
+      const rowImage = (row.imageUrl || "").trim() || null;
+      const rowVideo = (row.videoUrl || "").trim() || null;
+      const rowMedia = [
+        ...(rowImage ? [{ url: rowImage, type: "image" }] : []),
+        ...(rowVideo ? [{ url: rowVideo, type: "video" }] : []),
+      ];
+
+      const { data: post, error: postError } = await supabase
+        .from("scheduled_posts")
+        .insert({
+          user_id: OWNER_ID,
+          body: text,
+          image_url: rowImage,
+          media: rowMedia.length ? rowMedia : null,
+          link_url: (row.linkUrl || "").trim() || null,
+          first_comment: (row.firstComment || "").trim() || null,
+          content_type: contentTypeRaw || null,
+          scheduled_for: when.toISOString(),
+          status: "scheduled",
+          created_by: author?.id || null,
+        })
+        .select()
+        .single();
+      if (postError) {
+        errors.push({ row: rowNum, error: postError.message });
+        continue;
+      }
+
+      const { error: targetError } = await supabase.from("post_targets").insert(
+        targets.map((a) => ({ post_id: post.id, social_account_id: a.id, platform: a.platform, status: "scheduled" })),
+      );
+      if (targetError) {
+        await supabase.from("scheduled_posts").delete().eq("id", post.id);
+        errors.push({ row: rowNum, error: targetError.message });
+        continue;
+      }
+      created++;
+    }
+
+    await logActivity({
+      type: "post.imported",
+      title: `Imported ${created} post(s) from CSV${errors.length ? ` (${errors.length} row(s) skipped)` : ""}`,
+      status: errors.length ? "warning" : "success",
+      meta: { created, errors: errors.slice(0, 10) },
+    });
+
+    return { created, errors };
+  }
+
+  // POST /api/posts/verify — reconcile recent posts against the FB Graph API.
+  async verify() {
+    const supabase = this.supabaseService.createServiceClient();
+
+    const { data: posts, error } = await supabase
+      .from("scheduled_posts")
+      .select(
+        "id, body, status, sent_at, scheduled_for, post_targets(id, status, external_post_id, social_accounts(id, display_name, access_token, platform, external_account_id))",
+      )
+      .eq("user_id", OWNER_ID)
+      .in("status", ["sent", "scheduled", "publishing"])
+      .order("scheduled_for", { ascending: false })
+      .limit(100);
+    if (error) throw new InternalServerErrorException(error.message);
+
+    let checked = 0,
+      deleted = 0,
+      published = 0;
+
+    for (const post of posts || []) {
+      let postChanged = false;
+      const targetStatuses: string[] = [];
+
+      for (const target of post.post_targets || []) {
+        const account: any = target.social_accounts;
+        if (
+          !target.external_post_id ||
+          target.external_post_id.includes("_mock_") ||
+          !account ||
+          !["facebook", "instagram", "threads", "twitter", "youtube"].includes(account.platform) ||
+          !["sent", "scheduled", "publishing"].includes(target.status)
+        ) {
+          targetStatuses.push(target.status);
+          continue;
+        }
+
+        checked++;
+        let result;
+        try {
+          if (account.platform === "facebook") {
+            result = await checkFacebookPostStatus({ account, externalPostId: target.external_post_id });
+          } else if (account.platform === "youtube") {
+            // isPublished flips true when YouTube's native publishAt fires —
+            // that drives the scheduled → sent transition below.
+            result = await checkYouTubeVideoStatus({ account, videoId: target.external_post_id });
+          } else if (account.platform === "instagram") {
+            // IG/Threads/X posts are always live once sent — only existence matters.
+            result = { ...(await checkInstagramPostStatus({ account, externalPostId: target.external_post_id })), isPublished: true };
+          } else if (account.platform === "twitter") {
+            result = { ...(await checkXPostStatus({ account, externalPostId: target.external_post_id })), isPublished: true };
+          } else {
+            result = { ...(await checkThreadsPostStatus({ account, externalPostId: target.external_post_id })), isPublished: true };
+          }
+        } catch {
+          result = { exists: null };
+        }
+
+        const PLATFORM_LABELS: any = {
+          facebook: "Facebook",
+          instagram: "Instagram",
+          threads: "Threads",
+          twitter: "X",
+          youtube: "YouTube",
+        };
+        const platformName = PLATFORM_LABELS[account.platform] || "Facebook";
+
+        if (result.exists === false) {
+          const { error: updateError } = await supabase
+            .from("post_targets")
+            .update({ status: "deleted", last_error: `This post was deleted on ${platformName}.` })
+            .eq("id", target.id);
+          if (updateError) {
+            console.error("[verify] couldn't mark target deleted:", updateError.message);
+            targetStatuses.push(target.status);
+            continue;
+          }
+          targetStatuses.push("deleted");
+          deleted++;
+          postChanged = true;
+          await logActivity({
+            type: "post.deleted",
+            title: `Post deleted on ${platformName} — ${account.display_name}`,
+            status: "warning",
+            meta: { postId: post.id, page: account.display_name, preview: post.body.slice(0, 80) },
+          });
+        } else if (result.exists === true && result.isPublished && target.status === "scheduled") {
+          await supabase
+            .from("post_targets")
+            .update({ status: "sent", sent_at: new Date().toISOString() })
+            .eq("id", target.id);
+          targetStatuses.push("sent");
+          published++;
+          postChanged = true;
+          await logActivity({
+            type: "post.published",
+            title: `Scheduled post went live — ${account.display_name}`,
+            status: "success",
+            meta: { postId: post.id, page: account.display_name },
+          });
+        } else if (
+          account.platform === "facebook" &&
+          result.exists === true &&
+          !result.isPublished &&
+          target.status === "scheduled" &&
+          post.scheduled_for &&
+          Date.now() - new Date(post.scheduled_for).getTime() > 15 * 60 * 1000
+        ) {
+          // Stuck "dark post": created with published:false but Facebook never
+          // auto-published it, and its scheduled time is well past. Its
+          // permalink shows "content isn't available" to everyone except
+          // admins — force is_published:true to recover it.
+          try {
+            await publishUnpublishedFacebookPost({ account, externalPostId: target.external_post_id });
+            await supabase
+              .from("post_targets")
+              .update({ status: "sent", sent_at: new Date().toISOString(), last_error: null })
+              .eq("id", target.id);
+            targetStatuses.push("sent");
+            published++;
+            postChanged = true;
+            await logActivity({
+              type: "post.published",
+              title: `Recovered a stuck scheduled post — ${account.display_name}`,
+              status: "warning",
+              meta: { postId: post.id, page: account.display_name },
+            });
+          } catch (e) {
+            console.warn(`[verify] couldn't recover stuck post on ${account.display_name}:`, e.message);
+            targetStatuses.push(target.status);
+          }
+        } else {
+          targetStatuses.push(target.status);
+        }
+      }
+
+      if (!postChanged || !targetStatuses.length) continue;
+
+      let newStatus = post.status;
+      if (targetStatuses.every((s) => s === "deleted")) newStatus = "deleted";
+      else if (targetStatuses.every((s) => s === "sent" || s === "deleted")) newStatus = "sent";
+      if (newStatus !== post.status) {
+        const patch: any = { status: newStatus };
+        if (newStatus === "sent" && !post.sent_at) patch.sent_at = new Date().toISOString();
+        await supabase.from("scheduled_posts").update(patch).eq("id", post.id);
+      }
+    }
+
+    return { checked, deleted, published };
+  }
+}
