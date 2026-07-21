@@ -3,9 +3,14 @@ import { NestFactory } from "@nestjs/core";
 import { Logger } from "@nestjs/common";
 import { AppModule } from "./app.module";
 import { HttpExceptionFilter } from "./common/http-exception.filter";
+import { verifyConfig } from "./common/verify-config";
 import cookieParser from "cookie-parser";
 
 async function bootstrap() {
+  // Validate config BEFORE anything binds a port — a bad deploy should fail
+  // loudly here, not as a 500 on every authenticated request.
+  verifyConfig();
+
   const app = await NestFactory.create(AppModule, { bodyParser: true });
 
   // Match the original Next.js API surface: every route was served under /api/*.
