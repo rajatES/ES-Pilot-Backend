@@ -22,11 +22,12 @@ function isValidHttpsUrl(value: string) {
   }
 }
 
-// Required to serve any authenticated request at all.
+// Required to serve any request at all — the Postgres connection.
 const REQUIRED = [
-  { key: "SUPABASE_URL", url: true, alt: "NEXT_PUBLIC_SUPABASE_URL" },
-  { key: "SUPABASE_SERVICE_ROLE_KEY" },
-  { key: "SUPABASE_ANON_KEY", alt: "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY" },
+  { key: "DB_HOST" },
+  { key: "DB_USERNAME" },
+  { key: "DB_PASSWORD" },
+  { key: "DB_NAME" },
 ];
 
 // Not fatal — the app runs, but the related feature is unavailable.
@@ -40,6 +41,8 @@ const OPTIONAL = [
   { key: "GOOGLE_CLIENT_ID", feature: "YouTube publishing" },
   { key: "GOOGLE_CLIENT_SECRET", feature: "YouTube publishing" },
   { key: "CRON_SECRET", feature: "scheduled publishing + sync crons" },
+  { key: "S3_BUCKET", feature: "media uploads" },
+  { key: "AWS_REGION", feature: "media uploads" },
 ];
 
 export function verifyConfig() {

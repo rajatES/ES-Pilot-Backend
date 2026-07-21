@@ -2,6 +2,7 @@ import { Module } from "@nestjs/common";
 import { ConfigModule } from "@nestjs/config";
 import { ScheduleModule } from "@nestjs/schedule";
 import { APP_GUARD } from "@nestjs/core";
+import { DatabaseModule } from "./database/database.module";
 import { SupabaseModule } from "./supabase/supabase.module";
 import { SupabaseAuthGuard } from "./auth/supabase-auth.guard";
 import { HealthController } from "./health.controller";
@@ -33,6 +34,10 @@ import { QueuesModule } from "./modules/queues/queues.module";
     ConfigModule.forRoot({ isGlobal: true }),
     // Enables @Cron() jobs (used by the ported cron tasks in Phase 4).
     ScheduleModule.forRoot(),
+    // Postgres (Docker) — the schema now lives in database/entities.ts.
+    DatabaseModule,
+    // Retained while services are migrated off the Supabase client module by
+    // module; removed once the last .from(...) call site is converted.
     SupabaseModule,
     // Feature modules (posts, accounts, media, ...) are added here in Phase 4.
     PostsModule,
