@@ -6,6 +6,7 @@ import { DatabaseModule } from "./database/database.module";
 import { SupabaseModule } from "./supabase/supabase.module";
 import { AuthCoreModule } from "./auth/auth-core.module";
 import { JwtAuthGuard } from "./auth/jwt-auth.guard";
+import { StorageModule } from "./storage/storage.module";
 import { HealthController } from "./health.controller";
 import { PostsModule } from "./modules/posts/posts.module";
 import { MeModule } from "./modules/me/me.module";
@@ -42,6 +43,8 @@ import { QueuesModule } from "./modules/queues/queues.module";
     SupabaseModule,
     // Local JWT auth (login + user management), replaces Supabase Auth.
     AuthCoreModule,
+    // S3 media storage, replaces Supabase Storage.
+    StorageModule,
     // Feature modules (posts, accounts, media, ...) are added here in Phase 4.
     PostsModule,
     MeModule,

@@ -1,9 +1,13 @@
 import { BadRequestException, Injectable, InternalServerErrorException } from "@nestjs/common";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
+import { StorageService } from "../../storage/storage.service";
 
 @Injectable()
 export class MediaService {
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly supabaseService: SupabaseService,
+    private readonly storage: StorageService,
+  ) {}
 
   async list(filters: { folderId?: string; tag?: string; favorite?: string; q?: string }) {
     const supabase = this.supabaseService.createServiceClient();
@@ -97,8 +101,17 @@ export class MediaService {
 
   async remove(id: string) {
     const supabase = this.supabaseService.createServiceClient();
-    const { error } = await supabase.from("media_assets").delete().eq("id", id).eq("user_id", OWNER_ID);
+    // delete().select() returns the removed row so we can also drop the S3
+    // object (uploaded assets only; external/source assets have no key).
+    const { data, error } = await supabase
+      .from("media_assets")
+      .delete()
+      .eq("id", id)
+      .eq("user_id", OWNER_ID)
+      .select()
+      .maybeSingle();
     if (error) throw new InternalServerErrorException(error.message);
+    if (data?.storage_path) await this.storage.remove(data.storage_path);
     return { ok: true };
   }
 

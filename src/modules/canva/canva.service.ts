@@ -7,11 +7,15 @@ import {
   UnauthorizedException,
 } from "@nestjs/common";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
+import { StorageService } from "../../storage/storage.service";
 import { CANVA_API, canvaConfigured, getCanvaAccessToken } from "../../lib/canva";
 
 @Injectable()
 export class CanvaService {
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly supabaseService: SupabaseService,
+    private readonly storage: StorageService,
+  ) {}
 
   // Lists the logged-in teammate's own Canva designs.
   async designs(profile: any) {
@@ -85,16 +89,10 @@ export class CanvaService {
     // Persist to our storage: Canva export URLs expire quickly.
     const fileRes = await fetch(job.urls[0]);
     if (!fileRes.ok) throw new HttpException("Couldn't download the exported design.", HttpStatus.BAD_GATEWAY);
-    const buf = await fileRes.arrayBuffer();
+    const buf = Buffer.from(await fileRes.arrayBuffer());
 
-    const supabase = this.supabaseService.createServiceClient();
-    const path = `${OWNER_ID}/canva-${designId}-${Date.now()}.png`;
-    const { error: uploadError } = await supabase.storage
-      .from("post-media")
-      .upload(path, buf, { contentType: "image/png", upsert: true });
-    if (uploadError) throw new InternalServerErrorException(uploadError.message);
-
-    const { data: pub } = supabase.storage.from("post-media").getPublicUrl(path);
-    return { url: pub.publicUrl };
+    const key = `${OWNER_ID}/canva-${designId}-${Date.now()}.png`;
+    const { url } = await this.storage.put(key, buf, "image/png");
+    return { url };
   }
 }

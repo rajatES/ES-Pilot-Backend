@@ -1,42 +1,33 @@
-import { BadRequestException, Injectable, InternalServerErrorException } from "@nestjs/common";
+import { BadRequestException, Injectable } from "@nestjs/common";
 import { createHash } from "crypto";
-import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
+import { OWNER_ID } from "../../supabase/supabase.service";
+import { StorageService } from "../../storage/storage.service";
 
 @Injectable()
 export class UploadService {
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(private readonly storage: StorageService) {}
 
-  // Uploads an image to the public 'post-media' bucket using the service role
-  // (bypasses storage RLS — no user session needed).
+  // Uploads an image or video to S3 and returns a public HTTPS URL that the
+  // social platforms can fetch when publishing.
   async upload(file: any) {
     if (!file) {
       throw new BadRequestException("No file provided.");
     }
 
-    const supabase = this.supabaseService.createServiceClient();
-
     const originalName = file.originalname || "file";
     const safeName = originalName.replace(/[^a-zA-Z0-9._-]/g, "-");
-    const path = `${OWNER_ID}/${Date.now()}-${safeName}`;
+    const key = `${OWNER_ID}/${Date.now()}-${safeName}`;
 
     const buffer: Buffer = file.buffer;
     const hash = createHash("sha256").update(buffer).digest("hex");
 
-    const { error: uploadError } = await supabase.storage
-      .from("post-media")
-      .upload(path, buffer, { contentType: file.mimetype || "image/jpeg", upsert: true });
+    const { url } = await this.storage.put(key, buffer, file.mimetype || "application/octet-stream");
 
-    if (uploadError) {
-      console.error("[Upload] error:", uploadError.message);
-      throw new InternalServerErrorException(uploadError.message);
-    }
-
-    const { data } = supabase.storage.from("post-media").getPublicUrl(path);
     return {
-      url: data.publicUrl,
-      storagePath: path,
+      url,
+      storagePath: key,
       filename: safeName,
-      mimeType: file.mimetype || "image/jpeg",
+      mimeType: file.mimetype || "application/octet-stream",
       sizeBytes: buffer.byteLength,
       hash,
     };
