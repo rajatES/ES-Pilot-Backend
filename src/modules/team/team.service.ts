@@ -7,6 +7,7 @@ import {
   UnauthorizedException,
 } from "@nestjs/common";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
+import { AuthCoreService } from "../../auth/auth-core.service";
 
 // The hardcoded seed roster for POST /api/team/bulk, ported verbatim from the
 // original one-time seeding route.
@@ -52,7 +53,10 @@ const SEED_MEMBERS = [
 
 @Injectable()
 export class TeamService {
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly supabaseService: SupabaseService,
+    private readonly auth: AuthCoreService,
+  ) {}
 
   async list(me: any) {
     if (!me) throw new UnauthorizedException("Not logged in.");
@@ -62,6 +66,7 @@ export class TeamService {
       supabase.from("divisions").select("*").order("name", { ascending: true }),
     ]);
     if (error) throw new InternalServerErrorException(error.message);
+    for (const p of data || []) delete p.password_hash; // never expose hashes
     return { team: data, me, divisions: divisions || [] };
   }
 
@@ -75,31 +80,15 @@ export class TeamService {
       throw new BadRequestException("Email, a display name, and an 8+ character password are required.");
     }
 
-    const supabase = this.supabaseService.createServiceClient();
-    const { data: created, error: createError } = await supabase.auth.admin.createUser({
+    const profile = await this.auth.createUser({
       email: email.trim(),
       password,
-      email_confirm: true,
+      displayName: displayName.trim(),
+      role: role === "admin" ? "admin" : "member",
+      divisionId: divisionId || null,
+      isGroupHead: !!isGroupHead,
+      status: "active",
     });
-    if (createError) throw new BadRequestException(createError.message);
-
-    const { data: profile, error: profileError } = await supabase
-      .from("profiles")
-      .insert({
-        id: created.user.id,
-        email: email.trim(),
-        display_name: displayName.trim(),
-        role: role === "admin" ? "admin" : "member",
-        division_id: divisionId || null,
-        is_group_head: !!isGroupHead,
-        status: "active",
-      })
-      .select()
-      .single();
-    if (profileError) {
-      await supabase.auth.admin.deleteUser(created.user.id).catch(() => {});
-      throw new InternalServerErrorException(profileError.message);
-    }
 
     return { profile };
   }
@@ -114,8 +103,6 @@ export class TeamService {
 
     if (status === "rejected") {
       if (id === me.id) throw new BadRequestException("You can't remove your own seat.");
-      const { error: authError } = await supabase.auth.admin.deleteUser(id);
-      if (authError) throw new InternalServerErrorException(authError.message);
       await supabase.from("profiles").delete().eq("id", id);
       return { ok: true };
     }
@@ -146,9 +133,6 @@ export class TeamService {
     if (id === me.id) throw new BadRequestException("You can't remove your own seat.");
 
     const supabase = this.supabaseService.createServiceClient();
-    const { error: authError } = await supabase.auth.admin.deleteUser(id);
-    if (authError) throw new InternalServerErrorException(authError.message);
-
     await supabase.from("profiles").delete().eq("id", id);
     return { ok: true };
   }
@@ -253,39 +237,13 @@ export class TeamService {
       throw new BadRequestException("Email, a display name, and an 8+ character password are required.");
     }
 
-    let userId;
-    const { data: created, error: createError } = await supabase.auth.admin.createUser({
+    const profile = await this.auth.createUser({
       email: email.trim(),
       password,
-      email_confirm: true,
+      displayName: displayName.trim(),
+      role: "admin",
+      status: "active",
     });
-    if (createError) {
-      const { data: list, error: listError } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1000 });
-      const existing = list?.users?.find((u: any) => u.email?.toLowerCase() === email.trim().toLowerCase());
-      if (listError || !existing) {
-        throw new BadRequestException(createError.message);
-      }
-      const { error: updateError } = await supabase.auth.admin.updateUserById(existing.id, {
-        password,
-        email_confirm: true,
-      });
-      if (updateError) throw new BadRequestException(updateError.message);
-      userId = existing.id;
-    } else {
-      userId = created.user.id;
-    }
-
-    const { data: profile, error: profileError } = await supabase
-      .from("profiles")
-      .insert({ id: userId, email: email.trim(), display_name: displayName.trim(), role: "admin" })
-      .select()
-      .single();
-    if (profileError) {
-      if (created?.user) {
-        await supabase.auth.admin.deleteUser(created.user.id).catch(() => {});
-      }
-      throw new InternalServerErrorException(profileError.message);
-    }
 
     return { profile };
   }
@@ -295,43 +253,22 @@ export class TeamService {
     if (!me) throw new UnauthorizedException("Not logged in.");
     if (me.role !== "admin") throw new ForbiddenException("Admins only.");
 
-    const supabase = this.supabaseService.createServiceClient();
     const results: any = { created: [], skipped: [], failed: [] };
 
     for (const m of SEED_MEMBERS) {
       try {
-        const { data: existing } = await supabase.auth.admin.listUsers();
-        const alreadyExists = existing?.users?.find((u: any) => u.email === m.email);
-
-        if (alreadyExists) {
+        if (await this.auth.emailExists(m.email)) {
           results.skipped.push(m.email);
           continue;
         }
-
-        const { data: created, error: createError } = await supabase.auth.admin.createUser({
+        await this.auth.createUser({
           email: m.email,
           password: m.password,
-          email_confirm: true,
-        });
-
-        if (createError) {
-          results.failed.push({ email: m.email, error: createError.message });
-          continue;
-        }
-
-        const { error: profileError } = await supabase.from("profiles").insert({
-          id: created.user.id,
-          email: m.email,
-          display_name: m.displayName,
+          displayName: m.displayName,
           role: m.role === "GH" ? "GH" : "member",
+          isGroupHead: m.role === "GH",
           status: "active",
         });
-
-        if (profileError) {
-          results.failed.push({ email: m.email, error: profileError.message });
-          continue;
-        }
-
         results.created.push(m.email);
       } catch (err) {
         results.failed.push({ email: m.email, error: err.message });

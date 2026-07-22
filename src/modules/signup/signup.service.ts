@@ -1,9 +1,13 @@
 import { BadRequestException, Injectable, InternalServerErrorException } from "@nestjs/common";
 import { SupabaseService } from "../../supabase/supabase.service";
+import { AuthCoreService } from "../../auth/auth-core.service";
 
 @Injectable()
 export class SignupService {
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly supabaseService: SupabaseService,
+    private readonly auth: AuthCoreService,
+  ) {}
 
   // Public self-signup: creates the account immediately (own password) but the
   // profile stays "pending" until an admin approves. A "GH_" division-code
@@ -30,30 +34,17 @@ export class SignupService {
     if (divisionError) throw new InternalServerErrorException(divisionError.message);
     if (!division) throw new BadRequestException("That division code wasn't recognized. Check with your Group Head.");
 
-    const { data: created, error: createError } = await supabase.auth.admin.createUser({
+    // Self-signup creates the seat immediately but "pending" until an admin
+    // approves it. Password is bcrypt-hashed by AuthCoreService.
+    const profile = await this.auth.createUser({
       email: email.trim(),
       password,
-      email_confirm: true,
+      displayName: displayName.trim(),
+      role: "member",
+      divisionId: division.id,
+      isGroupHead,
+      status: "pending",
     });
-    if (createError) throw new BadRequestException(createError.message);
-
-    const { data: profile, error: profileError } = await supabase
-      .from("profiles")
-      .insert({
-        id: created.user.id,
-        email: email.trim(),
-        display_name: displayName.trim(),
-        role: "member",
-        division_id: division.id,
-        is_group_head: isGroupHead,
-        status: "pending",
-      })
-      .select()
-      .single();
-    if (profileError) {
-      await supabase.auth.admin.deleteUser(created.user.id).catch(() => {});
-      throw new InternalServerErrorException(profileError.message);
-    }
 
     return { profile };
   }

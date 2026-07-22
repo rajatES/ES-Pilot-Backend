@@ -22,12 +22,13 @@ function isValidHttpsUrl(value: string) {
   }
 }
 
-// Required to serve any request at all — the Postgres connection.
-const REQUIRED = [
+// Required to serve any request at all — the Postgres connection + JWT signing.
+const REQUIRED: { key: string; url?: boolean; alt?: string }[] = [
   { key: "DB_HOST" },
   { key: "DB_USERNAME" },
   { key: "DB_PASSWORD" },
   { key: "DB_NAME" },
+  { key: "JWT_SECRET" },
 ];
 
 // Not fatal — the app runs, but the related feature is unavailable.

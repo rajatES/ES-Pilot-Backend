@@ -4,7 +4,8 @@ import { ScheduleModule } from "@nestjs/schedule";
 import { APP_GUARD } from "@nestjs/core";
 import { DatabaseModule } from "./database/database.module";
 import { SupabaseModule } from "./supabase/supabase.module";
-import { SupabaseAuthGuard } from "./auth/supabase-auth.guard";
+import { AuthCoreModule } from "./auth/auth-core.module";
+import { JwtAuthGuard } from "./auth/jwt-auth.guard";
 import { HealthController } from "./health.controller";
 import { PostsModule } from "./modules/posts/posts.module";
 import { MeModule } from "./modules/me/me.module";
@@ -36,9 +37,11 @@ import { QueuesModule } from "./modules/queues/queues.module";
     ScheduleModule.forRoot(),
     // Postgres (Docker) — the schema now lives in database/entities.ts.
     DatabaseModule,
-    // Retained while services are migrated off the Supabase client module by
-    // module; removed once the last .from(...) call site is converted.
+    // SupabaseModule now exports the Postgres-backed data client (the name is
+    // retained so the 25 services that inject it don't all need editing).
     SupabaseModule,
+    // Local JWT auth (login + user management), replaces Supabase Auth.
+    AuthCoreModule,
     // Feature modules (posts, accounts, media, ...) are added here in Phase 4.
     PostsModule,
     MeModule,
@@ -65,7 +68,7 @@ import { QueuesModule } from "./modules/queues/queues.module";
   controllers: [HealthController],
   providers: [
     // Applied to every route; @Public() opts individual routes out.
-    { provide: APP_GUARD, useClass: SupabaseAuthGuard },
+    { provide: APP_GUARD, useClass: JwtAuthGuard },
   ],
 })
 export class AppModule {}
