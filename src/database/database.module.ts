@@ -2,15 +2,8 @@ import { Global, Module } from "@nestjs/common";
 import { TypeOrmModule } from "@nestjs/typeorm";
 import { ALL_ENTITIES } from "./entities";
 
-// Postgres connection (Docker container in dev, same image on EC2 in prod).
-//
-// DB_SYNC=true has TypeORM create/alter tables from the entity definitions —
-// how ES Studio runs, and what makes a fresh `docker compose up` immediately
-// usable. Switch it off and generate migrations once there's data worth
-// protecting.
-//
-// @Global so every feature module can inject repositories via
-// TypeOrmModule.forFeature([...]) without re-importing the connection.
+// Postgres connection. DB_SYNC=true syncs the schema from entity definitions.
+// @Global so feature modules can inject repositories without re-importing.
 @Global()
 @Module({
   imports: [

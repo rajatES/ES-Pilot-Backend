@@ -1,18 +1,14 @@
-// Meta Threads API — a SEPARATE surface from the Facebook Graph API:
-//   - host is graph.threads.net (not graph.facebook.com)
-//   - its own OAuth (threads.net/oauth/authorize) and its own app credentials
-//     (enable the "Threads API" use case in the Meta dashboard to get them)
-//   - tokens are per-Threads-profile, long-lived (~60 days), refreshable via
-//     th_refresh_token once they're at least 24h old
-//   - publishing is container-based like Instagram (create → poll → publish)
-//   - there is NO native scheduling — the cron queue publishes at post time.
+// Meta Threads API (graph.threads.net). Separate OAuth and app credentials
+// from the Facebook Graph API. Tokens are per-profile, ~60 days, refreshable
+// after 24h. Publishing is container-based; no native scheduling, so the cron
+// queue publishes at post time.
 
 const THREADS_GRAPH = "https://graph.threads.net/v1.0";
 const THREADS_AUTH = "https://threads.net/oauth/authorize";
 
 const SCOPES = "threads_basic,threads_content_publish,threads_manage_replies,threads_manage_insights";
 
-// Mirrors lib/facebook.js — one switch drives mock mode for all Meta surfaces.
+// One env switch drives mock mode for every platform (see lib/facebook.js).
 function isMockMode() {
   return (process.env.FACEBOOK_PUBLISH_MODE || "").trim().toLowerCase() !== "live";
 }
@@ -29,8 +25,7 @@ export function threadsRedirectUri() {
   return process.env.THREADS_REDIRECT_URI || "http://localhost:4000/api/auth/threads/callback";
 }
 
-// Folds a link into the post text — Threads auto-attaches a preview card for
-// the first URL in the text (there is no separate "link" field).
+// Threads has no link field; it previews the first URL found in the text.
 function appendLink(text, link) {
   if (!link || (text && text.includes(link))) return text;
   return text ? `${text}\n\n${link}` : link;

@@ -3,14 +3,9 @@ import * as bcrypt from "bcrypt";
 import * as jwt from "jsonwebtoken";
 import { SupabaseService } from "../supabase/supabase.service";
 
-// Local user management + JWT sessions — replaces Supabase Auth.
-//
-// Users live in the `profiles` table (password_hash + the existing role/
-// division/status columns). Login issues a signed JWT the frontend stores and
-// sends as `Authorization: Bearer <token>`; JwtAuthGuard verifies it.
-//
-// createUser / deleteUser / setPassword stand in for the old
-// supabase.auth.admin.* calls used by signup, team management, and bootstrap.
+// User management and JWT sessions. Users live in the profiles table
+// (bcrypt password_hash). Login issues a signed JWT the frontend sends as
+// a Bearer header; JwtAuthGuard verifies it.
 @Injectable()
 export class AuthCoreService {
   constructor(private readonly supabaseService: SupabaseService) {}
@@ -103,8 +98,8 @@ export class AuthCoreService {
     return { ok: true };
   }
 
-  // Verify credentials and mint a token. Pending seats can authenticate (the
-  // app shows a "waiting for approval" screen), matching the old behaviour.
+  // Verify credentials and mint a token. Pending seats can authenticate;
+  // the app shows a waiting-for-approval screen.
   async login(email: string, password: string) {
     if (!email?.trim() || !password) {
       throw new BadRequestException("Email and password are required.");

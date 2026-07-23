@@ -1,12 +1,7 @@
 import { Logger } from "@nestjs/common";
 
-// Fail fast on a misconfigured deploy.
-//
-// Without this, missing/placeholder config doesn't surface until the first
-// request, and then only as an opaque 500 ("Invalid supabaseUrl: Provided URL
-// is malformed") on EVERY authenticated route — which looks like an app bug
-// rather than a config mistake. Checking at boot turns that into one obvious
-// error before the process starts serving traffic.
+// Fail fast on a misconfigured deploy: missing or placeholder config surfaces
+// as one clear boot error instead of a 500 on every request.
 
 // Values copied from .env.example that were never filled in.
 function isPlaceholder(value: string) {

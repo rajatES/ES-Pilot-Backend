@@ -1,10 +1,8 @@
-// Keep in lockstep with lib/instagram.js and lib/facebookOAuth.js (v23.0) —
-// mixing Graph versions across the same page token invites subtle drift.
+// Keep the Graph version in lockstep with lib/instagram.js and lib/facebookOAuth.js.
 const GRAPH = "https://graph.facebook.com/v23.0";
 
-// Defaults to mock unless explicitly set to "live" — safe-by-default so a
-// fresh checkout never accidentally hits the real Graph API. Compared
-// case-insensitively: "Live" in a .env silently meant mock before.
+// Mock unless explicitly "live" (case-insensitive), so a fresh checkout never
+// hits the real APIs by accident.
 function isMockMode() {
   return (process.env.FACEBOOK_PUBLISH_MODE || "").trim().toLowerCase() !== "live";
 }
@@ -77,12 +75,9 @@ export async function publishFacebookPost({ account, post }) {
   }
 
   if (images.length === 1) {
-    // The /photos endpoint has no "link" field — without folding link_url
-    // into the caption text, an attached link is silently dropped and never
-    // appears (or becomes clickable) on the live post.
-    // published:true is the API default, but state it explicitly — an
-    // accidentally-unpublished photo becomes a "dark post" that only Page
-    // admins can ever see (public URL shows "content isn't available").
+    // /photos has no "link" field, so the link is folded into the caption.
+    // published:true is explicit: an unpublished photo is a dark post only
+    // Page admins can see.
     const res = await fetch(`${GRAPH}/${pageId}/photos`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -174,11 +169,8 @@ export async function scheduleFacebookPost({ account, post, scheduledFor }) {
   };
 
   if (images.length) {
-    // Meta's recommended pattern for scheduled PHOTO posts: upload each photo
-    // UNPUBLISHED first, then create the scheduled /feed post referencing them
-    // via attached_media. (The old shortcut — link: image_url — produced a
-    // link-preview post instead of a native photo and silently dropped the
-    // image whenever the post also had a real link_url.)
+    // Scheduled photo posts: upload each photo unpublished, then create the
+    // scheduled /feed post referencing them via attached_media.
     const mediaIds = [];
     for (const img of images.slice(0, 10)) {
       mediaIds.push(await uploadUnpublishedPhoto(pageId, account.access_token, img.url));
@@ -202,10 +194,8 @@ export async function scheduleFacebookPost({ account, post, scheduledFor }) {
   return { ...result, mode: "scheduled" };
 }
 
-// Force-publish a post that was created unpublished (published:false) but whose
-// scheduled_publish_time has passed without Facebook publishing it — a "stuck
-// dark post". Its permalink shows "This content isn't available" to everyone
-// except Page admins until is_published is flipped on.
+// Force-publish a scheduled post Facebook failed to auto-publish (a stuck
+// dark post, invisible to everyone except Page admins).
 export async function publishUnpublishedFacebookPost({ account, externalPostId }) {
   if (isMockMode()) return { ok: true };
   if (!account.access_token) throw new Error("Facebook Page access token is missing.");

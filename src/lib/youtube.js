@@ -34,15 +34,10 @@ export async function getYouTubeAccessToken(refreshToken) {
   return data.access_token;
 }
 
-// Publish a video to YouTube end-to-end: download the stored video, run the
-// resumable upload (init → PUT bytes), optionally set a custom thumbnail.
-//
-// scheduledFor (optional): uses YouTube's NATIVE scheduling — the video
-// uploads immediately as "private" with status.publishAt, and YouTube flips
-// it public at that time. Without scheduledFor it publishes as "public" now.
-//
-// post.media must contain exactly one video; the first image (if any) becomes
-// the custom thumbnail (best-effort — requires a verified channel).
+// Publish a video: download from storage, resumable-upload to YouTube, set an
+// optional thumbnail from the first attached image. With scheduledFor the
+// video uploads private with status.publishAt (native scheduling); otherwise
+// it publishes public immediately.
 export async function publishYouTubeVideo({ account, post, scheduledFor }) {
   const media = Array.isArray(post.media) && post.media.length
     ? post.media
@@ -99,8 +94,7 @@ export async function publishYouTubeVideo({ account, post, scheduledFor }) {
   const sessionUri = initRes.headers.get("location");
   if (!sessionUri) throw new Error("No upload session URI returned from YouTube.");
 
-  // 3. Upload the bytes in one shot (our files are ≤200MB — well within a
-  // single request; YouTube resumes are only needed for flaky/huge uploads).
+  // 3. Upload the bytes (single request; files are capped at 200MB).
   const uploadRes = await fetch(sessionUri, {
     method: "PUT",
     headers: { "Content-Type": contentType, "Content-Length": String(buffer.byteLength) },
@@ -112,8 +106,7 @@ export async function publishYouTubeVideo({ account, post, scheduledFor }) {
   }
   const videoId = uploadData.id;
 
-  // 4. Custom thumbnail from the first attached image — best-effort (needs a
-  // phone-verified channel; never fails the publish).
+  // 4. Best-effort thumbnail (needs a phone-verified channel; never fatal).
   const thumb = media.find((m) => m.type === "image");
   if (thumb) {
     try {

@@ -1,16 +1,9 @@
 import { Injectable, InternalServerErrorException } from "@nestjs/common";
 import { S3Client, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 
-// S3-backed media storage (replaces Supabase Storage).
-//
-// Uploaded images/videos MUST be reachable by a public HTTPS URL because Meta,
-// Threads, Instagram, X, and YouTube fetch the media from that URL when
-// publishing. So the bucket must serve objects publicly (bucket policy or, if
-// you keep the bucket private, front it with CloudFront and set S3_PUBLIC_URL
-// to the distribution domain).
-//
-// Auth: on EC2 attach an IAM role (no keys needed — the SDK picks it up). For
-// local dev set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in backend/.env.
+// S3 media storage. Objects must be publicly readable: the social platforms
+// fetch media by URL when publishing. Credentials come from env keys locally
+// or the instance IAM role in production.
 @Injectable()
 export class StorageService {
   private client: S3Client | null = null;

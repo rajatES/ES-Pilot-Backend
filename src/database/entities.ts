@@ -1,12 +1,6 @@
-// TypeORM entities — the schema that used to live in supabase/*.sql.
-//
-// Column names stay snake_case so the shape matches what the services and the
-// frontend already expect (post.scheduled_for, account.external_account_id …);
-// only the storage engine changed, not the data contract.
-//
-// DB_SYNC=true lets TypeORM create/alter tables from these definitions, which
-// is how ES Studio runs. Turn it OFF once there's production data worth
-// protecting and switch to generated migrations.
+// TypeORM entities — the application schema. Column names are snake_case to
+// match the API data contract. DB_SYNC=true creates/alters tables from these
+// definitions; switch to generated migrations once production data exists.
 
 import {
   Column,

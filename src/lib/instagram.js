@@ -53,11 +53,9 @@ async function publishContainer(igUserId, accessToken, creationId) {
   return data.id;
 }
 
-// Publish to an Instagram Business/Creator account.
-// IG requires media — text-only posts are not allowed. Container flow:
-//   single image  → image container → publish
-//   single video  → REELS container → poll until processed → publish
-//   2-10 items    → child containers (is_carousel_item) → CAROUSEL container → publish
+// Publish to an Instagram Business/Creator account (media required).
+// Single image → image container; single video → REELS container with status
+// polling; 2-10 items → child containers + CAROUSEL container.
 export async function publishInstagramPost({ account, post }) {
   const media = postMedia(post);
   if (!media.length) {

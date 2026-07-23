@@ -1,13 +1,8 @@
-// X (Twitter) API v2 — OAuth 2.0 user context with PKCE.
-//
-// Token model is unlike the other platforms: access tokens live ~2 HOURS and
-// refresh tokens ROTATE on every refresh (the old one is invalidated). So this
-// lib refreshes just-in-time before each call and persists the new pair itself
-// (same precedent as lib/activity.js importing the supabase helper).
-//
-// Media uploads use the v2 chunked protocol (INIT → APPEND → FINALIZE, with
-// STATUS polling for video processing). X has NO native scheduling — the cron
-// queue publishes at post time, like Instagram and Threads.
+// X API v2, OAuth 2.0 user context with PKCE. Access tokens last ~2h and
+// refresh tokens rotate on every refresh, so tokens are refreshed just-in-time
+// and the rotated pair is persisted immediately. Media uses the chunked
+// INIT/APPEND/FINALIZE protocol. No native scheduling; the cron queue
+// publishes at post time.
 
 import { createServiceSupabase } from "./supabaseServer";
 
@@ -33,7 +28,7 @@ export function xRedirectUri() {
   return process.env.X_REDIRECT_URI || "http://localhost:4000/api/auth/x/callback";
 }
 
-// X auto-wraps links (t.co); just append it to the text like other platforms.
+// X auto-shortens links (t.co); append to the text.
 function appendLink(text, link) {
   if (!link || (text && text.includes(link))) return text;
   return text ? `${text}\n\n${link}` : link;
@@ -103,9 +98,8 @@ export async function fetchXProfile(accessToken) {
   };
 }
 
-// Returns a valid access token, refreshing (and persisting the rotated pair)
-// when the stored one is expired or about to expire. Mutates `account` so a
-// multi-step flow (upload → tweet → reply) reuses the fresh token.
+// Returns a valid access token, refreshing when expired or near expiry.
+// Mutates `account` so multi-step flows reuse the fresh token.
 export async function getFreshXAccessToken(account) {
   const expiresAt = account.token_expires_at ? new Date(account.token_expires_at).getTime() : 0;
   if (account.access_token && expiresAt > Date.now() + 5 * 60 * 1000) {
@@ -139,8 +133,7 @@ export async function getFreshXAccessToken(account) {
     token_expires_at: new Date(Date.now() + (data.expires_in || 7200) * 1000).toISOString()
   };
 
-  // Persist the ROTATED pair immediately — losing a rotated refresh token
-  // permanently orphans the connection.
+  // Persist immediately: losing a rotated refresh token orphans the connection.
   if (account.id) {
     try {
       const supabase = createServiceSupabase();

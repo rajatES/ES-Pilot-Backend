@@ -3,11 +3,9 @@ import { Reflector } from "@nestjs/core";
 import { AuthCoreService } from "./auth-core.service";
 import { IS_PUBLIC_KEY } from "./public.decorator";
 
-// Verifies the JWT the frontend sends as `Authorization: Bearer <token>`, loads
-// the profile row, and attaches it to the request. Replaces SupabaseAuthGuard.
-//
-// Routes decorated with @Public() (login, signup, cron, OAuth callbacks,
-// team-exists/bootstrap) skip this and do their own authorization.
+// Verifies the Bearer JWT, loads the profile row, and attaches it to the
+// request. @Public() routes (login, signup, cron, OAuth callbacks) skip this
+// and handle their own authorization.
 @Injectable()
 export class JwtAuthGuard implements CanActivate {
   constructor(

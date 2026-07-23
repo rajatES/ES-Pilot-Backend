@@ -1,20 +1,13 @@
-// Postgres data layer — a drop-in replacement for the Supabase service-role
-// client, backed by a `pg` pool against our own Docker Postgres.
-//
-// Why a compatibility layer instead of rewriting 157 call sites: the existing
-// query chains (.from().select().eq()...) are already correct and tested. This
-// re-implements exactly the subset of the supabase-js query builder the app
-// uses (filters, ordering, single/maybeSingle, insert/update/delete/upsert,
-// count, and nested embedded selects) and runs it as parameterised SQL. The
-// TypeORM entities own the SCHEMA (created via DB_SYNC); this owns query
-// EXECUTION. All migration risk lives in this one file.
+// Postgres data layer. Implements the subset of the supabase-js query builder
+// the services use (filters, ordering, single/maybeSingle, mutations, count,
+// nested embedded selects) as parameterised SQL over a pg pool. Schema is
+// owned by the TypeORM entities (database/entities.ts).
 
 import pg from "pg";
 const { Pool, types } = pg;
 
-// Single-user mode: every row belongs to this fixed owner id (shared workspace).
-// This is the DATA scope, independent of which user is logged in (auth handles
-// that separately now via JWT).
+// Shared-workspace owner id: all data rows belong to this fixed id,
+// independent of which user is logged in.
 export const OWNER_ID = "00000000-0000-0000-0000-000000000001";
 
 // Return numeric/bigint as JS numbers (Supabase did); default pg gives strings.
@@ -36,8 +29,8 @@ export function getPool() {
   return pool;
 }
 
-// Per-table column type cache — drives correct serialisation of jsonb (which
-// node-pg would otherwise mangle when the value is an array, e.g. media[]).
+// Per-table column type cache; needed to serialise jsonb correctly
+// (node-pg formats bare JS arrays as pg arrays, not JSON).
 const typeCache = {};
 async function columnTypes(table) {
   if (typeCache[table]) return typeCache[table];
@@ -67,9 +60,8 @@ function coerceWrite(colInfo, value) {
   return value;
 }
 
-// Embedded-resource relationships (Supabase inferred these from FK constraints;
-// we declare the ones the app actually embeds). parentKey lives on the row
-// being embedded INTO; childKey on the embedded table.
+// Relationships used by embedded selects. parentKey is on the row being
+// embedded into; childKey on the embedded table.
 const RELATIONSHIPS = {
   scheduled_posts: {
     post_targets: { table: "post_targets", parentKey: "id", childKey: "post_id", many: true },
@@ -115,8 +107,7 @@ function splitTopLevel(s) {
   return out;
 }
 
-// Attach embedded resources to a set of parent rows (one batched query per
-// embed level — correct, and cheap at our data volumes).
+// Attach embedded resources to parent rows (one batched query per level).
 async function resolveEmbeds(table, rows, embeds) {
   if (!rows.length || !embeds.length) return;
   const rels = RELATIONSHIPS[table] || {};
@@ -348,8 +339,7 @@ class QueryBuilder {
   }
 }
 
-// A minimal client exposing just `.from(table)`. Storage/auth are handled by
-// dedicated services now (S3 + JWT), not this object.
+// Data client entry point. Storage and auth live in dedicated services.
 export function createServiceSupabase() {
   return {
     from(table) {
