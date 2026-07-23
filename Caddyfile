@@ -1,0 +1,5 @@
+# Reverse proxy with automatic Let's Encrypt certificates.
+# CADDY_DOMAIN must resolve to this server's public IP.
+{$CADDY_DOMAIN} {
+	reverse_proxy backend:4000
+}
