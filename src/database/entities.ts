@@ -201,6 +201,16 @@ export class ScheduledPost {
   @Column({ name: "first_comment", type: "text", nullable: true })
   first_comment: string | null;
 
+  // Per-platform caption overrides: { facebook?: string, instagram?: … }.
+  // Null/missing platform → falls back to `body` (lib/postContent.js).
+  @Column({ name: "platform_captions", type: "jsonb", nullable: true })
+  platform_captions: Record<string, string> | null;
+
+  // Per-platform publish options: { facebook?: { format: "post"|"reel"|"story" },
+  // instagram?: { format: "feed"|"reel" }, youtube?: { title?, privacy? } }.
+  @Column({ name: "platform_options", type: "jsonb", nullable: true })
+  platform_options: Record<string, any> | null;
+
   @Column({ name: "content_type", type: "text", nullable: true })
   content_type: string | null;
 
@@ -545,6 +555,38 @@ export class Campaign {
   created_at: Date;
 }
 
+// ── Developer API keys (external integrations) ──────────────────────────
+// Full key is shown once at creation and stored only as a sha256 hash;
+// key_prefix (e.g. "pp_live_3f9a…") is kept for display in Settings.
+@Entity("api_keys")
+export class ApiKey {
+  @PrimaryGeneratedColumn("uuid")
+  id: string;
+
+  @Column()
+  name: string; // human label, e.g. "n8n automation"
+
+  @Index({ unique: true })
+  @Column({ name: "key_hash", type: "text" })
+  key_hash: string;
+
+  @Column({ name: "key_prefix", type: "text" })
+  key_prefix: string;
+
+  @Index()
+  @Column({ name: "created_by", type: "uuid", nullable: true })
+  created_by: string | null;
+
+  @Column({ name: "last_used_at", type: "timestamptz", nullable: true })
+  last_used_at: Date | null;
+
+  @Column({ name: "revoked_at", type: "timestamptz", nullable: true })
+  revoked_at: Date | null;
+
+  @CreateDateColumn({ name: "created_at", type: "timestamptz" })
+  created_at: Date;
+}
+
 export const ALL_ENTITIES = [
   Profile,
   Division,
@@ -562,4 +604,5 @@ export const ALL_ENTITIES = [
   AppSetting,
   UserIntegration,
   Campaign,
+  ApiKey,
 ];

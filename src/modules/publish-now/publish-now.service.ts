@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, InternalServerErrorException, NotFoundException } from "@nestjs/common";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
-import { publishFacebookPost, postFacebookComment } from "../../lib/facebook";
+import { publishFacebookPost, publishFacebookReel, publishFacebookStory, postFacebookComment } from "../../lib/facebook";
 import { publishInstagramPost, postInstagramComment } from "../../lib/instagram";
 import { publishThreadsPost, postThreadsReply } from "../../lib/threads";
 import { publishXPost, postXReply } from "../../lib/x";
@@ -8,6 +8,13 @@ import { publishYouTubeVideo } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
 import { runCompliance } from "../../lib/compliance";
+import {
+  postForPlatform,
+  platformOptions,
+  fbFormat,
+  sanitizePlatformCaptions,
+  sanitizePlatformOptions,
+} from "../../lib/postContent";
 
 @Injectable()
 export class PublishNowService {
@@ -17,6 +24,8 @@ export class PublishNowService {
     const supabase = this.supabaseService.createServiceClient();
 
     const { body, imageUrl, media, linkUrl, socialAccountIds, firstComment, contentType, templateId } = payload || {};
+    const pCaptions = sanitizePlatformCaptions(payload?.platformCaptions);
+    const pOptions = sanitizePlatformOptions(payload?.platformOptions);
 
     if (!body?.trim() || !socialAccountIds?.length) {
       throw new BadRequestException("Post text and at least one Page are required.");
@@ -45,6 +54,17 @@ export class PublishNowService {
     if (!mediaList.some((m) => m.type === "video") && accounts.some((a) => a.platform === "youtube")) {
       throw new BadRequestException("YouTube posts require a video — attach one or deselect the YouTube channel.");
     }
+    // Facebook Reel/Story media requirements (format from platform_options).
+    if (accounts.some((a) => a.platform === "facebook")) {
+      const fbFmt = pOptions?.facebook?.format || "post";
+      const videoCount = mediaList.filter((m) => m.type === "video").length;
+      if (fbFmt === "reel" && (videoCount !== 1 || mediaList.length !== 1)) {
+        throw new BadRequestException("A Facebook Reel needs exactly one video (no images).");
+      }
+      if (fbFmt === "story" && mediaList.length !== 1) {
+        throw new BadRequestException("A Facebook Story needs exactly one image or video.");
+      }
+    }
 
     // Compliance is advisory only — flags shown in UI but never block publishing.
     runCompliance({ body, linkUrl, imageUrl: firstImage, contentType, accounts });
@@ -62,6 +82,8 @@ export class PublishNowService {
         first_comment: firstComment || null,
         content_type: contentType || null,
         template_id: templateId || null,
+        platform_captions: pCaptions,
+        platform_options: pOptions,
         created_by: author?.id || null,
         scheduled_for: now,
         status: "publishing",
@@ -94,7 +116,13 @@ export class PublishNowService {
       }
 
       try {
-        const postData = { ...post, body: body.trim(), image_url: firstImage, media: mediaList, link_url: outboundLink };
+        // Per-platform caption override (falls back to the master body).
+        const postData = {
+          ...postForPlatform({ ...post, body: body.trim() }, account.platform),
+          image_url: firstImage,
+          media: mediaList,
+          link_url: outboundLink,
+        };
         const publishResult =
           account.platform === "instagram"
             ? await publishInstagramPost({ account, post: postData })
@@ -103,8 +131,12 @@ export class PublishNowService {
               : account.platform === "twitter"
                 ? await publishXPost({ account, post: postData })
                 : account.platform === "youtube"
-                  ? await publishYouTubeVideo({ account, post: postData } as any)
-                  : await publishFacebookPost({ account, post: postData });
+                  ? await publishYouTubeVideo({ account, post: postData, options: platformOptions(post, "youtube") } as any)
+                  : fbFormat(post) === "reel"
+                    ? await publishFacebookReel({ account, post: postData })
+                    : fbFormat(post) === "story"
+                      ? await publishFacebookStory({ account, post: postData })
+                      : await publishFacebookPost({ account, post: postData });
 
         const sentAt = new Date().toISOString();
 
@@ -115,7 +147,9 @@ export class PublishNowService {
           .eq("social_account_id", account.id);
 
         // Best-effort first comment — never fails the publish itself.
-        if (firstComment?.trim() && publishResult.externalPostId) {
+        // (Stories have no comments — skip them.)
+        const isStory = account.platform === "facebook" && fbFormat(post) === "story";
+        if (!isStory && firstComment?.trim() && publishResult.externalPostId) {
           try {
             if (account.platform === "instagram") {
               await postInstagramComment({ account, mediaId: publishResult.externalPostId, message: firstComment });

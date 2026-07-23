@@ -7,12 +7,13 @@ import {
   UnauthorizedException,
 } from "@nestjs/common";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
-import { scheduleFacebookPost, publishFacebookPost, postFacebookComment } from "../../lib/facebook";
+import { scheduleFacebookPost, publishFacebookPost, publishFacebookReel, publishFacebookStory, postFacebookComment } from "../../lib/facebook";
 import { publishInstagramPost, postInstagramComment } from "../../lib/instagram";
 import { publishThreadsPost, postThreadsReply } from "../../lib/threads";
 import { publishXPost, postXReply } from "../../lib/x";
 import { publishYouTubeVideo } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
+import { postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
 
 const INSTANT_WINDOW_MS = 10 * 60 * 1000;
 
@@ -116,10 +117,13 @@ export class ApprovalsService {
       }
 
       try {
-        const postData = { ...post };
+        // Per-platform caption override (falls back to the master body).
+        const postData = postForPlatform(post, account.platform);
         let result, targetStatus, sentAt = null;
 
-        if (["instagram", "threads", "twitter"].includes(account.platform) && !publishNow) {
+        // FB Reels/Stories are cron-queued like IG/Threads/X (no native scheduling).
+        const fbNonFeed = account.platform === "facebook" && fbFormat(post) !== "post";
+        if ((["instagram", "threads", "twitter"].includes(account.platform) || fbNonFeed) && !publishNow) {
           // No native scheduling on these platforms — leave the target queued;
           // /api/cron/publish sends it when the scheduled time arrives.
           await supabase.from("post_targets").update({ status: "scheduled" }).eq("id", target.id);
@@ -129,7 +133,7 @@ export class ApprovalsService {
 
         if (account.platform === "youtube") {
           // Uploads now; future posts use YouTube's native publishAt.
-          result = await publishYouTubeVideo({ account, post: postData, scheduledFor: publishNow ? null : post.scheduled_for });
+          result = await publishYouTubeVideo({ account, post: postData, scheduledFor: publishNow ? null : post.scheduled_for, options: platformOptions(post, "youtube") });
           targetStatus = publishNow ? "sent" : "scheduled";
           if (publishNow) sentAt = new Date().toISOString();
         } else if (account.platform === "instagram") {
@@ -145,10 +149,16 @@ export class ApprovalsService {
           targetStatus = "sent";
           sentAt = new Date().toISOString();
         } else if (publishNow) {
-          result = await publishFacebookPost({ account, post: postData });
+          const format = fbFormat(post);
+          result = format === "reel"
+            ? await publishFacebookReel({ account, post: postData })
+            : format === "story"
+              ? await publishFacebookStory({ account, post: postData })
+              : await publishFacebookPost({ account, post: postData });
           targetStatus = "sent";
           sentAt = new Date().toISOString();
         } else {
+          // Only format "post" reaches here — reels/stories were queued above.
           result = await scheduleFacebookPost({ account, post: postData, scheduledFor: post.scheduled_for });
           targetStatus = "scheduled";
         }
@@ -158,7 +168,9 @@ export class ApprovalsService {
           .update({ status: targetStatus, external_post_id: result.externalPostId, sent_at: sentAt })
           .eq("id", target.id);
 
-        if (targetStatus === "sent" && post.first_comment?.trim() && result.externalPostId) {
+        // Stories have no comments — skip the first comment for them.
+        const isStory = account.platform === "facebook" && fbFormat(post) === "story";
+        if (targetStatus === "sent" && !isStory && post.first_comment?.trim() && result.externalPostId) {
           try {
             if (account.platform === "instagram") {
               await postInstagramComment({ account, mediaId: result.externalPostId, message: post.first_comment });

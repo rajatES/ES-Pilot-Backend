@@ -14,7 +14,6 @@ import { SettingsModule } from "./modules/settings/settings.module";
 import { NotificationsModule } from "./modules/notifications/notifications.module";
 import { TemplatesModule } from "./modules/templates/templates.module";
 import { SearchModule } from "./modules/search/search.module";
-import { AiModule } from "./modules/ai/ai.module";
 import { AccountsModule } from "./modules/accounts/accounts.module";
 import { MediaModule } from "./modules/media/media.module";
 import { TeamModule } from "./modules/team/team.module";
@@ -29,6 +28,8 @@ import { SocialModule } from "./modules/social/social.module";
 import { AuthModule } from "./modules/auth/auth.module";
 import { CronModule } from "./modules/cron/cron.module";
 import { QueuesModule } from "./modules/queues/queues.module";
+import { ApiKeysModule } from "./modules/api-keys/api-keys.module";
+import { PublicApiModule } from "./modules/public-api/public-api.module";
 
 @Module({
   imports: [
@@ -52,7 +53,6 @@ import { QueuesModule } from "./modules/queues/queues.module";
     NotificationsModule,
     TemplatesModule,
     SearchModule,
-    AiModule,
     AccountsModule,
     MediaModule,
     TeamModule,
@@ -67,6 +67,9 @@ import { QueuesModule } from "./modules/queues/queues.module";
     AuthModule,
     CronModule,
     QueuesModule,
+    // Developer API: key management (Settings) + external /api/v1 surface.
+    ApiKeysModule,
+    PublicApiModule,
   ],
   controllers: [HealthController],
   providers: [

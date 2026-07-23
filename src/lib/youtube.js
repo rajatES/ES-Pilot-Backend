@@ -38,7 +38,7 @@ export async function getYouTubeAccessToken(refreshToken) {
 // optional thumbnail from the first attached image. With scheduledFor the
 // video uploads private with status.publishAt (native scheduling); otherwise
 // it publishes public immediately.
-export async function publishYouTubeVideo({ account, post, scheduledFor }) {
+export async function publishYouTubeVideo({ account, post, scheduledFor, options = {} }) {
   const media = Array.isArray(post.media) && post.media.length
     ? post.media
     : post.image_url ? [{ url: post.image_url, type: "image" }] : [];
@@ -53,18 +53,23 @@ export async function publishYouTubeVideo({ account, post, scheduledFor }) {
 
   const accessToken = await getYouTubeAccessToken(account.refresh_token);
 
-  // Title = first line of the caption (YouTube caps titles at 100 chars);
-  // description = full caption + link.
-  const title = (post.body || "").split("\n")[0].slice(0, 100) || "Untitled Video";
+  // Title = explicit per-platform option, else first line of the caption
+  // (YouTube caps titles at 100 chars); description = full caption + link.
+  const title = (options.title || "").trim().slice(0, 100)
+    || (post.body || "").split("\n")[0].slice(0, 100)
+    || "Untitled Video";
   let description = post.body || "";
   if (post.link_url && !description.includes(post.link_url)) {
     description = description ? `${description}\n\n${post.link_url}` : post.link_url;
   }
 
+  // Native scheduling requires "private" until publishAt fires; otherwise
+  // honor the requested privacy (default public).
+  const privacy = ["public", "unlisted", "private"].includes(options.privacy) ? options.privacy : "public";
   const metadata = {
     snippet: { title, description, categoryId: "22" },
     status: {
-      privacyStatus: scheduledFor ? "private" : "public",
+      privacyStatus: scheduledFor ? "private" : privacy,
       selfDeclaredMadeForKids: false,
       ...(scheduledFor ? { publishAt: new Date(scheduledFor).toISOString() } : {})
     }

@@ -330,3 +330,147 @@ async function parseFbResponse(res) {
   }
   return { externalPostId: data.post_id || data.id };
 }
+
+// ── Reels & Stories ──────────────────────────────────────────────────────────
+// Both use a start → upload (rupload.facebook.com, header-based file_url) →
+// finish flow. Neither supports native scheduling (Stories have no
+// scheduled_publish_time at all; scheduled Reels create dark-post recovery
+// problems), so scheduled reels/stories go through the cron queue like IG.
+
+const RUPLOAD = "https://rupload.facebook.com";
+
+// Upload a hosted video to an upload session. rupload uses HEADERS (not a
+// JSON body) and the "OAuth" auth scheme — unlike everything else here.
+async function ruploadHostedFile(kind, videoId, accessToken, fileUrl) {
+  const res = await fetch(`${RUPLOAD}/${kind}/${videoId}`, {
+    method: "POST",
+    headers: { Authorization: `OAuth ${accessToken}`, file_url: fileUrl },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.success === false) {
+    throw new Error(data?.debug_info?.message || data?.error?.message || "Video upload to Facebook failed.");
+  }
+}
+
+// Poll a video's processing status until it's ready (mirrors the IG
+// waitForContainer pattern).
+async function waitForVideoReady(videoId, accessToken, { timeoutMs = 4 * 60 * 1000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const params = new URLSearchParams({ fields: "status", access_token: accessToken });
+    const res = await fetch(`${GRAPH}/${videoId}?${params}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error?.message || "Couldn't check the video's processing status.");
+    const status = data?.status?.video_status;
+    if (status === "ready") return;
+    if (status === "error") throw new Error("Facebook failed to process the video.");
+    if (Date.now() > deadline) throw new Error("Timed out waiting for Facebook to process the video.");
+    await new Promise((r) => setTimeout(r, 5000));
+  }
+}
+
+// Publish a Reel to a Facebook Page. Requires exactly one video in the post
+// media. Returns { externalPostId } (the reel's video id).
+export async function publishFacebookReel({ account, post }) {
+  if (isMockMode()) {
+    return { externalPostId: mockPostId("reel") };
+  }
+  if (!account.access_token) throw new Error("Facebook Page access token is missing.");
+
+  const pageId = account.external_account_id;
+  const video = postMedia(post).find((m) => m.type === "video");
+  if (!video) throw new Error("A Facebook Reel needs exactly one video.");
+
+  // 1. Start an upload session.
+  const startRes = await fetch(`${GRAPH}/${pageId}/video_reels`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ upload_phase: "start", access_token: account.access_token }),
+  });
+  const start = await startRes.json();
+  if (!startRes.ok || !start.video_id) {
+    throw new Error(start?.error?.message || "Couldn't start the Reel upload.");
+  }
+
+  // 2. Hand Facebook the hosted file URL.
+  await ruploadHostedFile("video_reels", start.video_id, account.access_token, video.url);
+
+  // 3. Finish + publish with the caption.
+  const finishRes = await fetch(`${GRAPH}/${pageId}/video_reels`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      upload_phase: "finish",
+      video_id: start.video_id,
+      video_state: "PUBLISHED",
+      description: appendLink(post.body, post.link_url),
+      access_token: account.access_token,
+    }),
+  });
+  const finish = await finishRes.json();
+  if (!finishRes.ok || finish?.success === false) {
+    throw new Error(finish?.error?.message || "Couldn't publish the Reel.");
+  }
+
+  // 4. Wait for processing so the verify cron doesn't race an "uploading" reel.
+  await waitForVideoReady(start.video_id, account.access_token).catch((e) => {
+    // Publishing succeeded — processing lag is not a failure.
+    console.warn(`[facebook] reel ${start.video_id} still processing:`, e.message);
+  });
+
+  return { externalPostId: start.video_id };
+}
+
+// Publish a Story to a Facebook Page from the post's single media item.
+// Photo stories reuse the unpublished-photo upload; video stories use the
+// start/rupload/finish flow. Stories expire after 24h and have no comments.
+export async function publishFacebookStory({ account, post }) {
+  if (isMockMode()) {
+    return { externalPostId: mockPostId("story") };
+  }
+  if (!account.access_token) throw new Error("Facebook Page access token is missing.");
+
+  const pageId = account.external_account_id;
+  const media = postMedia(post)[0];
+  if (!media) throw new Error("A Facebook Story needs one image or video.");
+
+  if (media.type !== "video") {
+    // Photo story: upload unpublished, then attach to /photo_stories.
+    const photoId = await uploadUnpublishedPhoto(pageId, account.access_token, media.url);
+    const res = await fetch(`${GRAPH}/${pageId}/photo_stories`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ photo_id: photoId, access_token: account.access_token }),
+    });
+    const data = await res.json();
+    if (!res.ok || data?.success === false) {
+      throw new Error(data?.error?.message || "Couldn't publish the photo Story.");
+    }
+    return { externalPostId: data.post_id || photoId };
+  }
+
+  // Video story: start → rupload → finish.
+  const startRes = await fetch(`${GRAPH}/${pageId}/video_stories`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ upload_phase: "start", access_token: account.access_token }),
+  });
+  const start = await startRes.json();
+  if (!startRes.ok || !start.video_id) {
+    throw new Error(start?.error?.message || "Couldn't start the video Story upload.");
+  }
+
+  await ruploadHostedFile("video_stories", start.video_id, account.access_token, media.url);
+
+  const finishRes = await fetch(`${GRAPH}/${pageId}/video_stories`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ upload_phase: "finish", video_id: start.video_id, access_token: account.access_token }),
+  });
+  const finish = await finishRes.json();
+  if (!finishRes.ok || finish?.success === false) {
+    throw new Error(finish?.error?.message || "Couldn't publish the video Story.");
+  }
+
+  return { externalPostId: finish.post_id || start.video_id };
+}

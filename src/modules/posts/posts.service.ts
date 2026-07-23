@@ -11,6 +11,8 @@ import { QueuesService } from "../queues/queues.service";
 import {
   scheduleFacebookPost,
   publishFacebookPost,
+  publishFacebookReel,
+  publishFacebookStory,
   postFacebookComment,
   updateScheduledFacebookPost,
   checkFacebookPostStatus,
@@ -23,6 +25,13 @@ import { publishYouTubeVideo, checkYouTubeVideoStatus } from "../../lib/youtube"
 import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
 import { runCompliance } from "../../lib/compliance";
+import {
+  postForPlatform,
+  platformOptions,
+  fbFormat,
+  sanitizePlatformCaptions,
+  sanitizePlatformOptions,
+} from "../../lib/postContent";
 
 // Facebook's native scheduler only accepts times 10 min – 30 days out.
 // Anything sooner than 10 min (or in the past) we just publish immediately.
@@ -76,8 +85,13 @@ export class PostsService {
       templateId,
       firstComment,
       saveAs,
+      platformCaptions,
+      platformOptions: platformOptionsInput,
     } = payload || {};
     const accountIds = Array.isArray(socialAccountIds) ? socialAccountIds : [];
+    // Per-platform caption overrides / options (nullable jsonb columns).
+    const pCaptions = sanitizePlatformCaptions(platformCaptions);
+    const pOptions = sanitizePlatformOptions(platformOptionsInput);
 
     // Ordered media list [{url, type: "image"|"video"}]. imageUrl is the
     // legacy single-image field — fold it in so older clients keep working.
@@ -108,6 +122,8 @@ export class PostsService {
           content_type: contentType || null,
           template_id: templateId || null,
           first_comment: firstComment || null,
+          platform_captions: pCaptions,
+          platform_options: pOptions,
           created_by: author?.id || null,
         })
         .select()
@@ -179,6 +195,17 @@ export class PostsService {
     if (!mediaList.some((m) => m.type === "video") && accounts.some((a) => a.platform === "youtube")) {
       throw new BadRequestException("YouTube posts require a video — attach one or deselect the YouTube channel.");
     }
+    // Facebook Reel/Story media requirements (format from platform_options).
+    if (accounts.some((a) => a.platform === "facebook")) {
+      const fbFmt = pOptions?.facebook?.format || "post";
+      const videoCount = mediaList.filter((m) => m.type === "video").length;
+      if (fbFmt === "reel" && (videoCount !== 1 || mediaList.length !== 1)) {
+        throw new BadRequestException("A Facebook Reel needs exactly one video (no images).");
+      }
+      if (fbFmt === "story" && mediaList.length !== 1) {
+        throw new BadRequestException("A Facebook Story needs exactly one image or video.");
+      }
+    }
 
     // Compliance is advisory only — flags are shown in the UI but never block
     // posting or scheduling. This is intentional during the iterative rollout.
@@ -195,6 +222,8 @@ export class PostsService {
         content_type: contentType || null,
         template_id: templateId || null,
         first_comment: firstComment || null,
+        platform_captions: pCaptions,
+        platform_options: pOptions,
         created_by: author?.id || null,
         scheduled_for: (publishNow ? new Date() : scheduledDate).toISOString(),
         status: initialStatus,
@@ -228,10 +257,14 @@ export class PostsService {
       }
 
       try {
-        const postData = { ...post, link_url: outboundLink };
+        // Per-platform caption override (falls back to the master body).
+        const postData = { ...postForPlatform(post, account.platform), link_url: outboundLink };
         let result, targetStatus, sentAt = null;
 
-        if (["instagram", "threads", "twitter"].includes(account.platform) && !publishNow) {
+        // FB Reels/Stories have no reliable native scheduling — cron-queue
+        // them exactly like IG/Threads/X.
+        const fbNonFeed = account.platform === "facebook" && fbFormat(post) !== "post";
+        if ((["instagram", "threads", "twitter"].includes(account.platform) || fbNonFeed) && !publishNow) {
           // These platforms have no native scheduling — leave the target
           // queued; /api/cron/publish sends it when the scheduled time arrives.
           results.push({ accountId: account.id, name: account.display_name, status: "scheduled", queued: true });
@@ -246,6 +279,7 @@ export class PostsService {
             account,
             post: postData,
             scheduledFor: publishNow ? null : effectiveScheduledFor,
+            options: platformOptions(post, "youtube"),
           });
           targetStatus = publishNow ? "sent" : "scheduled";
           if (publishNow) sentAt = new Date().toISOString();
@@ -262,10 +296,16 @@ export class PostsService {
           targetStatus = "sent";
           sentAt = new Date().toISOString();
         } else if (publishNow) {
-          result = await publishFacebookPost({ account, post: postData });
+          const format = fbFormat(post);
+          result = format === "reel"
+            ? await publishFacebookReel({ account, post: postData })
+            : format === "story"
+              ? await publishFacebookStory({ account, post: postData })
+              : await publishFacebookPost({ account, post: postData });
           targetStatus = "sent";
           sentAt = new Date().toISOString();
         } else {
+          // Only format "post" reaches here — reels/stories were queued above.
           result = await scheduleFacebookPost({ account, post: postData, scheduledFor: effectiveScheduledFor });
           targetStatus = "scheduled";
         }
@@ -279,7 +319,9 @@ export class PostsService {
         // Best-effort first comment — only possible once a post is actually live
         // (immediate publish). A native-scheduler post can't get one from here
         // since this route isn't invoked again when Facebook publishes it later.
-        if (targetStatus === "sent" && firstComment?.trim() && result.externalPostId) {
+        // Stories have no comments — skip them.
+        const isStory = account.platform === "facebook" && fbFormat(post) === "story";
+        if (targetStatus === "sent" && !isStory && firstComment?.trim() && result.externalPostId) {
           try {
             if (account.platform === "instagram") {
               await postInstagramComment({ account, mediaId: result.externalPostId, message: firstComment });
@@ -524,6 +566,8 @@ export class PostsService {
         link_url: post.link_url,
         first_comment: post.first_comment,
         template_id: post.template_id,
+        platform_captions: post.platform_captions || null,
+        platform_options: post.platform_options || null,
         scheduled_for: when.toISOString(),
         status: "scheduled",
         created_by: author?.id || null,
@@ -706,7 +750,10 @@ export class PostsService {
           target.external_post_id.includes("_mock_") ||
           !account ||
           !["facebook", "instagram", "threads", "twitter", "youtube"].includes(account.platform) ||
-          !["sent", "scheduled", "publishing"].includes(target.status)
+          !["sent", "scheduled", "publishing"].includes(target.status) ||
+          // Reels/Stories are exempt: stories expire after 24h (a 404 is NOT a
+          // deletion) and reel video-ids need a different status lookup.
+          (account.platform === "facebook" && fbFormat(post) !== "post")
         ) {
           targetStatuses.push(target.status);
           continue;

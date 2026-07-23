@@ -133,45 +133,4 @@ export class QueuesService {
     );
   }
 
-  // Best posting times derived from historical engagement: buckets every
-  // synced insight by (weekday, hour) in the workspace timezone and ranks by
-  // average engagement.
-  async bestTimes(accountId?: string) {
-    const supabase = this.supabaseService.createServiceClient();
-    const timeZone = await this.workspaceTimezone();
-
-    let q = supabase
-      .from("post_insights")
-      .select("likes, comments, shares, post_targets(sent_at, social_account_id)")
-      .limit(500);
-    const { data, error } = await q;
-    if (error) throw new InternalServerErrorException(error.message);
-
-    const buckets = new Map<string, { weekday: number; hour: number; total: number; count: number }>();
-    const fmt = new Intl.DateTimeFormat("en-US", { timeZone, weekday: "short", hour: "numeric", hour12: false });
-
-    for (const row of data || []) {
-      const t: any = row.post_targets;
-      if (!t?.sent_at) continue;
-      if (accountId && t.social_account_id !== accountId) continue;
-
-      const parts = fmt.formatToParts(new Date(t.sent_at));
-      const weekdayName = parts.find((p) => p.type === "weekday")?.value || "Sun";
-      const hour = Number(parts.find((p) => p.type === "hour")?.value || 0) % 24;
-      const weekday = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(weekdayName);
-
-      const key = `${weekday}-${hour}`;
-      const bucket = buckets.get(key) || { weekday, hour, total: 0, count: 0 };
-      bucket.total += (row.likes || 0) + (row.comments || 0) + (row.shares || 0);
-      bucket.count += 1;
-      buckets.set(key, bucket);
-    }
-
-    const suggestions = [...buckets.values()]
-      .map((b) => ({ weekday: b.weekday, hour: b.hour, avgEngagement: +(b.total / b.count).toFixed(1), samples: b.count }))
-      .sort((a, b) => b.avgEngagement - a.avgEngagement)
-      .slice(0, 5);
-
-    return { suggestions, timezone: timeZone };
-  }
 }

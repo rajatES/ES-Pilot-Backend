@@ -1,13 +1,14 @@
 import { Injectable, InternalServerErrorException, UnauthorizedException } from "@nestjs/common";
 import { createHash } from "crypto";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
-import { publishFacebookPost, postFacebookComment, checkFacebookPostStatus, getFacebookPostMetrics } from "../../lib/facebook";
+import { publishFacebookPost, publishFacebookReel, publishFacebookStory, postFacebookComment, checkFacebookPostStatus, getFacebookPostMetrics } from "../../lib/facebook";
 import { publishInstagramPost, postInstagramComment, checkInstagramPostStatus, getInstagramPostMetrics } from "../../lib/instagram";
 import { publishThreadsPost, postThreadsReply, checkThreadsPostStatus, refreshThreadsToken, getThreadsPostMetrics } from "../../lib/threads";
 import { publishXPost, postXReply, checkXPostStatus, getXPostMetrics } from "../../lib/x";
 import { publishYouTubeVideo, checkYouTubeVideoStatus, getYouTubeVideoAnalytics } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
+import { postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
 
 @Injectable()
 export class CronService {
@@ -61,16 +62,22 @@ export class CronService {
       for (const target of queued) {
         const account: any = target.social_accounts;
         try {
+          // Per-platform caption override (falls back to the master body).
+          const postData = postForPlatform(post, account.platform);
           const result =
             account.platform === "instagram"
-              ? await publishInstagramPost({ account, post })
+              ? await publishInstagramPost({ account, post: postData })
               : account.platform === "threads"
-                ? await publishThreadsPost({ account, post })
+                ? await publishThreadsPost({ account, post: postData })
                 : account.platform === "twitter"
-                  ? await publishXPost({ account, post })
+                  ? await publishXPost({ account, post: postData })
                   : account.platform === "youtube"
-                    ? await publishYouTubeVideo({ account, post } as any)
-                    : await publishFacebookPost({ account, post });
+                    ? await publishYouTubeVideo({ account, post: postData, options: platformOptions(post, "youtube") } as any)
+                    : fbFormat(post) === "reel"
+                      ? await publishFacebookReel({ account, post: postData })
+                      : fbFormat(post) === "story"
+                        ? await publishFacebookStory({ account, post: postData })
+                        : await publishFacebookPost({ account, post: postData });
 
           await supabase
             .from("post_targets")
@@ -83,7 +90,9 @@ export class CronService {
             .eq("id", target.id);
           published++;
 
-          if (post.first_comment?.trim() && result.externalPostId) {
+          // Stories have no comments — skip the first comment for them.
+          const isStory = account.platform === "facebook" && fbFormat(post) === "story";
+          if (!isStory && post.first_comment?.trim() && result.externalPostId) {
             try {
               if (account.platform === "instagram") {
                 await postInstagramComment({ account, mediaId: result.externalPostId, message: post.first_comment });
@@ -167,6 +176,12 @@ export class CronService {
         const account: any = target.social_accounts;
 
         if (!target.external_post_id || target.external_post_id.includes("_mock_") || !account) {
+          targetStatuses.push(target.status);
+          continue;
+        }
+        // Reels/Stories are exempt from existence checks: stories expire after
+        // 24h (a 404 is NOT a deletion) and reel ids need a different lookup.
+        if (account.platform === "facebook" && fbFormat(post) !== "post") {
           targetStatuses.push(target.status);
           continue;
         }

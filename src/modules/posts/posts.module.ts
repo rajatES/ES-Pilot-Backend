@@ -7,5 +7,8 @@ import { QueuesModule } from "../queues/queues.module";
   imports: [QueuesModule],
   controllers: [PostsController],
   providers: [PostsService],
+  // Exported for the external v1 API (modules/public-api), which delegates
+  // post creation here so both surfaces share one publishing pipeline.
+  exports: [PostsService],
 })
 export class PostsModule {}

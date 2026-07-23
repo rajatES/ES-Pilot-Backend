@@ -12,7 +12,7 @@ declare module "*/lib/utm";
 declare module "*/lib/compliance";
 declare module "*/lib/sports";
 declare module "*/lib/sportsEntities";
-declare module "*/lib/ai";
 declare module "*/lib/facebookOAuth";
+declare module "*/lib/postContent";
 declare module "*/lib/threads";
 declare module "*/lib/x";

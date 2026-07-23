@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Put, Query } from "@nestjs/common";
+import { Body, Controller, Get, Param, Put } from "@nestjs/common";
 import { QueuesService } from "./queues.service";
 
 @Controller("queues")
@@ -9,12 +9,6 @@ export class QueuesController {
   @Get()
   list() {
     return this.queues.list();
-  }
-
-  // GET /api/queues/best-times?accountId= — engagement-derived suggestions.
-  @Get("best-times")
-  bestTimes(@Query("accountId") accountId?: string) {
-    return this.queues.bestTimes(accountId);
   }
 
   // PUT /api/queues/:accountId — replace that account's weekly slot grid.
