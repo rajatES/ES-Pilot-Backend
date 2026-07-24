@@ -17,6 +17,8 @@ import { SearchModule } from "./modules/search/search.module";
 import { AccountsModule } from "./modules/accounts/accounts.module";
 import { MediaModule } from "./modules/media/media.module";
 import { TeamModule } from "./modules/team/team.module";
+import { DivisionsModule } from "./modules/divisions/divisions.module";
+import { SportsModule } from "./modules/sports/sports.module";
 import { DashboardModule } from "./modules/dashboard/dashboard.module";
 import { ApprovalsModule } from "./modules/approvals/approvals.module";
 import { PublishNowModule } from "./modules/publish-now/publish-now.module";
@@ -56,6 +58,8 @@ import { PublicApiModule } from "./modules/public-api/public-api.module";
     AccountsModule,
     MediaModule,
     TeamModule,
+    DivisionsModule,
+    SportsModule,
     DashboardModule,
     ApprovalsModule,
     PublishNowModule,

@@ -85,6 +85,25 @@ export class Division {
   created_at: Date;
 }
 
+// Sport / vertical taxonomy — the editable list behind the account "category"
+// field. Seeded with the historical defaults on first read; admins add/remove
+// entries from the Accounts hub. "Other" is a reserved fallback, never stored.
+@Entity("sports")
+export class Sport {
+  @PrimaryGeneratedColumn("uuid")
+  id: string;
+
+  @Column({ unique: true })
+  name: string;
+
+  // Preserves the default ordering; custom entries append after the defaults.
+  @Column({ name: "sort_order", type: "int", default: 0 })
+  sort_order: number;
+
+  @CreateDateColumn({ name: "created_at", type: "timestamptz" })
+  created_at: Date;
+}
+
 // ── Connected social accounts ────────────────────────────────────────────
 @Entity("social_accounts")
 @Unique(["user_id", "platform", "external_account_id"])
@@ -590,6 +609,7 @@ export class ApiKey {
 export const ALL_ENTITIES = [
   Profile,
   Division,
+  Sport,
   SocialAccount,
   ScheduledPost,
   PostTarget,

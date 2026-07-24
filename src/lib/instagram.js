@@ -90,6 +90,11 @@ export async function publishInstagramPost({ account, post }) {
       await waitForContainer(creationId, token);
     } else {
       creationId = await createContainer(igUserId, token, { image_url: m.url, caption });
+      // Even image containers aren't ready the instant they're created —
+      // Instagram first has to fetch the URL. Publishing before the container
+      // reaches FINISHED is what returns "Media ID is not available", so wait
+      // (usually returns immediately; a bad/unreachable URL surfaces as ERROR).
+      await waitForContainer(creationId, token, { timeoutMs: 90 * 1000 });
     }
   } else {
     // Carousel: 2–10 children.
@@ -99,7 +104,9 @@ export async function publishInstagramPost({ account, post }) {
         ? { media_type: "VIDEO", video_url: m.url, is_carousel_item: true }
         : { image_url: m.url, is_carousel_item: true };
       const childId = await createContainer(igUserId, token, fields);
-      if (m.type === "video") await waitForContainer(childId, token);
+      // Wait for each child (image or video) to finish before it joins the
+      // carousel — an unready child fails the parent with "Media ID is not available".
+      await waitForContainer(childId, token, m.type === "video" ? undefined : { timeoutMs: 90 * 1000 });
       childIds.push(childId);
     }
     creationId = await createContainer(igUserId, token, {

@@ -32,6 +32,10 @@ async function bootstrap() {
     origin: origins,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "X-API-Key"],
+    // Cache the CORS preflight for 24h. Without this the browser re-runs the
+    // OPTIONS handshake before EVERY mutation, doubling the round-trips a
+    // publish/delete/reschedule pays. (Chrome caps this at 2h regardless.)
+    maxAge: 86400,
   });
 
   // Render errors as { error: "<message>" } to match the original API contract.
