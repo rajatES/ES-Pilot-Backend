@@ -9,7 +9,6 @@ import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { QueuesService } from "../queues/queues.service";
 // Ported plain-JS integrations (allowJs). Types resolve to `any`.
 import {
-  scheduleFacebookPost,
   publishFacebookPost,
   publishFacebookReel,
   publishFacebookStory,
@@ -286,12 +285,13 @@ export class PostsService {
         const postData = { ...postForPlatform(post, account.platform), link_url: outboundLink };
         let result, targetStatus, sentAt = null;
 
-        // FB Reels/Stories have no reliable native scheduling — cron-queue
-        // them exactly like IG/Threads/X.
-        const fbNonFeed = account.platform === "facebook" && fbFormat(post) !== "post";
-        if ((["instagram", "threads", "twitter"].includes(account.platform) || fbNonFeed) && !publishNow) {
-          // These platforms have no native scheduling — leave the target
-          // queued; /api/cron/publish sends it when the scheduled time arrives.
+        // Only YouTube keeps native scheduling (resumable upload + publishAt
+        // flip). Everything else is published from OUR cron queue when the
+        // scheduled time arrives (/api/cron/publish) — including Facebook feed
+        // posts. Meta's native scheduler owns the publish moment and never lets
+        // us attach the first comment afterwards, so we schedule FB ourselves
+        // too, exactly like IG/Threads/X and FB Reels/Stories.
+        if (account.platform !== "youtube" && !publishNow) {
           results.push({ accountId: account.id, name: account.display_name, status: "scheduled", queued: true });
           continue;
         }
@@ -320,7 +320,10 @@ export class PostsService {
           result = await publishThreadsPost({ account, post: postData });
           targetStatus = "sent";
           sentAt = new Date().toISOString();
-        } else if (publishNow) {
+        } else {
+          // Facebook, publish now. Scheduled FB posts were queued above and are
+          // published later by /api/cron/publish (which also posts the first
+          // comment), so only the immediate case reaches here.
           const format = fbFormat(post);
           result = format === "reel"
             ? await publishFacebookReel({ account, post: postData })
@@ -329,10 +332,6 @@ export class PostsService {
               : await publishFacebookPost({ account, post: postData });
           targetStatus = "sent";
           sentAt = new Date().toISOString();
-        } else {
-          // Only format "post" reaches here — reels/stories were queued above.
-          result = await scheduleFacebookPost({ account, post: postData, scheduledFor: effectiveScheduledFor });
-          targetStatus = "scheduled";
         }
 
         await supabase
