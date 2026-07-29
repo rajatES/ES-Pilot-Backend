@@ -1,6 +1,7 @@
 import "reflect-metadata";
 import { NestFactory } from "@nestjs/core";
 import { Logger } from "@nestjs/common";
+import { NestExpressApplication } from "@nestjs/platform-express";
 import { AppModule } from "./app.module";
 import { HttpExceptionFilter } from "./common/http-exception.filter";
 import { verifyConfig } from "./common/verify-config";
@@ -11,7 +12,12 @@ async function bootstrap() {
   // loudly here, not as a 500 on every authenticated request.
   verifyConfig();
 
-  const app = await NestFactory.create(AppModule, { bodyParser: true });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, { bodyParser: false });
+
+  // Raise the JSON body limit so the Design Template image-derive endpoint can
+  // accept a base64 data URL (Express defaults to 100kb).
+  app.useBodyParser("json", { limit: "12mb" });
+  app.useBodyParser("urlencoded", { extended: true, limit: "12mb" });
 
   // Match the original Next.js API surface: every route was served under /api/*.
   // Keeping the prefix means the frontend only has to swap the origin, not paths.

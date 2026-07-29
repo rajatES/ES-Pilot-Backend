@@ -315,6 +315,7 @@ export async function getXPostMetrics({ account, externalPostId }) {
   return {
     likes: m.like_count ?? 0,
     comments: m.reply_count ?? 0,
+    replies: m.reply_count ?? null,
     shares: (m.retweet_count ?? 0) + (m.quote_count ?? 0),
     impressions: m.impression_count ?? null,
     reach: null,

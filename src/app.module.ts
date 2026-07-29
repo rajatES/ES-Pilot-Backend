@@ -20,6 +20,8 @@ import { TeamModule } from "./modules/team/team.module";
 import { DivisionsModule } from "./modules/divisions/divisions.module";
 import { SportsModule } from "./modules/sports/sports.module";
 import { DashboardModule } from "./modules/dashboard/dashboard.module";
+import { InsightsModule } from "./modules/insights/insights.module";
+import { DesignTemplatesModule } from "./modules/design-templates/design-templates.module";
 import { ApprovalsModule } from "./modules/approvals/approvals.module";
 import { PublishNowModule } from "./modules/publish-now/publish-now.module";
 import { SignupModule } from "./modules/signup/signup.module";
@@ -54,6 +56,7 @@ import { PublicApiModule } from "./modules/public-api/public-api.module";
     SettingsModule,
     NotificationsModule,
     TemplatesModule,
+    DesignTemplatesModule,
     SearchModule,
     AccountsModule,
     MediaModule,
@@ -61,6 +64,7 @@ import { PublicApiModule } from "./modules/public-api/public-api.module";
     DivisionsModule,
     SportsModule,
     DashboardModule,
+    InsightsModule,
     ApprovalsModule,
     PublishNowModule,
     SignupModule,

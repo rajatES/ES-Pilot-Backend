@@ -14,8 +14,12 @@ import { publishXPost, postXReply } from "../../lib/x";
 import { publishYouTubeVideo } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
 import { postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
+// @ts-ignore - plain JS fact-check gate (env-gated, fail-open, no-op without a key).
+import { factCheckCaption, factCheckEnabled } from "../../lib/factcheck";
 
 const INSTANT_WINDOW_MS = 10 * 60 * 1000;
+
+const POST_WITH_TARGETS = "*, post_targets(*, social_accounts(id, display_name, platform, avatar_url))";
 
 @Injectable()
 export class ApprovalsService {
@@ -36,7 +40,7 @@ export class ApprovalsService {
     const supabase = this.supabaseService.createServiceClient();
     if (!me) throw new UnauthorizedException("Not logged in.");
 
-    const { postId, action, comment } = payload || {};
+    const { postId, action, comment, override } = payload || {};
     const reviewer = me.display_name || "You";
     if (!postId || !action) throw new BadRequestException("postId and action required.");
 
@@ -73,17 +77,17 @@ export class ApprovalsService {
     });
 
     if (action !== "approve") {
-      const next =
+      const next: any =
         action === "submit"
-          ? { approval_status: "pending", status: "pending_review" }
-          : { approval_status: "rejected", status: "rejected" };
+          ? { approval_status: "pending", status: "pending_review", auto_approve_at: await this.autoApproveAt(supabase) }
+          : { approval_status: "rejected", status: "rejected", auto_approve_at: null };
 
       const { data: post, error } = await supabase
         .from("scheduled_posts")
         .update(next)
         .eq("id", postId)
         .eq("user_id", OWNER_ID)
-        .select("*, post_targets(*, social_accounts(id, display_name, platform, avatar_url))")
+        .select(POST_WITH_TARGETS)
         .single();
       if (error) throw new InternalServerErrorException(error.message);
 
@@ -96,7 +100,7 @@ export class ApprovalsService {
       return { post };
     }
 
-    // ── approve: actually publish/schedule now ──
+    // ── approve ──
     const { data: post, error: fetchError } = await supabase
       .from("scheduled_posts")
       .select("*, post_targets(*, social_accounts(*))")
@@ -105,6 +109,40 @@ export class ApprovalsService {
       .single();
     if (fetchError || !post) throw new NotFoundException(fetchError?.message || "Post not found.");
 
+    // Fact-check gate (skipped on explicit override). On block/flag the post is
+    // held in pending_review with the verdict attached so the reviewer can then
+    // "Approve anyway" (override:true).
+    let applied = post.fact_check || null;
+    if (!override && factCheckEnabled()) {
+      const fc = await factCheckCaption({ caption: post.body || "" });
+      if (fc.action === "block" || fc.action === "flag") {
+        const { data: held } = await supabase
+          .from("scheduled_posts")
+          .update({ fact_check: fc })
+          .eq("id", postId)
+          .eq("user_id", OWNER_ID)
+          .select(POST_WITH_TARGETS)
+          .single();
+        await logActivity({
+          type: "approval.factcheck",
+          title: `Fact-check ${fc.action} — held for review`,
+          status: "warning",
+          meta: { postId, reason: fc.reason },
+        });
+        return { post: held, factCheck: fc, held: true };
+      }
+      applied = fc;
+    }
+    if (override && post.fact_check) {
+      applied = { ...post.fact_check, overridden: true, overridden_by: reviewer, at: new Date().toISOString() };
+    }
+
+    return this.publishApprovedPost(supabase, post, reviewer, applied);
+  }
+
+  // Publishes/schedules every target of an approved post, then finalizes the
+  // post row. Shared by manual approve and the auto-approve cron.
+  private async publishApprovedPost(supabase: any, post: any, reviewer: string, factCheck: any) {
     const diffMs = new Date(post.scheduled_for).getTime() - Date.now();
     const publishNow = diffMs <= INSTANT_WINDOW_MS;
     const results: any[] = [];
@@ -119,7 +157,9 @@ export class ApprovalsService {
       try {
         // Per-platform caption override (falls back to the master body).
         const postData = postForPlatform(post, account.platform);
-        let result, targetStatus, sentAt = null;
+        let result,
+          targetStatus,
+          sentAt = null;
 
         // FB Reels/Stories are cron-queued like IG/Threads/X (no native scheduling).
         const fbNonFeed = account.platform === "facebook" && fbFormat(post) !== "post";
@@ -200,10 +240,16 @@ export class ApprovalsService {
 
     const { data: updated, error: updateError } = await supabase
       .from("scheduled_posts")
-      .update({ status: finalStatus, approval_status: "approved", sent_at: allSent ? new Date().toISOString() : null })
-      .eq("id", postId)
+      .update({
+        status: finalStatus,
+        approval_status: "approved",
+        auto_approve_at: null,
+        fact_check: factCheck,
+        sent_at: allSent ? new Date().toISOString() : null,
+      })
+      .eq("id", post.id)
       .eq("user_id", OWNER_ID)
-      .select("*, post_targets(*, social_accounts(id, display_name, platform, avatar_url))")
+      .select(POST_WITH_TARGETS)
       .single();
     if (updateError) throw new InternalServerErrorException(updateError.message);
 
@@ -211,11 +257,74 @@ export class ApprovalsService {
       type: allFailed ? "post.failed" : "approval.approve",
       title: allFailed
         ? "Approved post failed on all pages"
-        : `Approved and published to ${results.filter((r) => r.status !== "failed").length} page(s)`,
+        : `Approved and published to ${results.filter((r) => r.status !== "failed").length} page(s) by ${reviewer}`,
       status: allFailed ? "error" : anyFailed ? "warning" : "success",
-      meta: { postId, results: results.map((r) => ({ name: r.name, status: r.status })) },
+      meta: { postId: post.id, results: results.map((r) => ({ name: r.name, status: r.status })) },
     });
 
     return { post: updated, warning: anyFailed && !allFailed ? "Some pages failed." : null };
+  }
+
+  // Resolves the auto-approve deadline for a freshly-submitted post from the
+  // shared app setting, or null when auto-approve is off.
+  private async autoApproveAt(supabase: any): Promise<string | null> {
+    const { data } = await supabase
+      .from("app_settings")
+      .select("value")
+      .eq("user_id", OWNER_ID)
+      .eq("key", "app")
+      .maybeSingle();
+    const cfg = data?.value || {};
+    if (!cfg.autoApprove) return null;
+    const hours = Number(cfg.autoApproveHours) > 0 ? Number(cfg.autoApproveHours) : 24;
+    return new Date(Date.now() + hours * 3600000).toISOString();
+  }
+
+  // Cron entry point: approve every pending_review post whose auto_approve_at
+  // has passed (unless the fact-check gate blocks/flags it).
+  async autoApproveDue() {
+    const supabase = this.supabaseService.createServiceClient();
+    const nowIso = new Date().toISOString();
+
+    const { data: due, error } = await supabase
+      .from("scheduled_posts")
+      .select("*, post_targets(*, social_accounts(*))")
+      .eq("user_id", OWNER_ID)
+      .eq("status", "pending_review")
+      .not("auto_approve_at", "is", null)
+      .lte("auto_approve_at", nowIso)
+      .limit(25);
+    if (error) throw new InternalServerErrorException(error.message);
+
+    let approved = 0,
+      held = 0,
+      failed = 0;
+
+    for (const post of due || []) {
+      // A baked-in block never auto-waves through.
+      if (post.fact_check?.action === "block") {
+        held++;
+        continue;
+      }
+      try {
+        let applied = post.fact_check || null;
+        if (factCheckEnabled() && !post.fact_check?.checked) {
+          const fc = await factCheckCaption({ caption: post.body || "" });
+          if (fc.action === "block" || fc.action === "flag") {
+            await supabase.from("scheduled_posts").update({ fact_check: fc }).eq("id", post.id);
+            held++;
+            continue;
+          }
+          applied = fc;
+        }
+        await this.publishApprovedPost(supabase, post, "Auto-approve", applied);
+        approved++;
+      } catch (e) {
+        failed++;
+        console.warn(`[auto-approve] failed for post ${post.id}:`, e.message);
+      }
+    }
+
+    return { due: (due || []).length, approved, held, failed };
   }
 }

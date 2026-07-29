@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, Post } from "@nestjs/common";
+import { Body, Controller, Delete, Get, HttpCode, Param, Post, Query } from "@nestjs/common";
 import { ApiKeysService } from "./api-keys.service";
 import { CurrentProfile } from "../../auth/current-user.decorator";
 
@@ -13,6 +13,18 @@ export class ApiKeysController {
   @Get()
   list(@CurrentProfile() me: any) {
     return this.apiKeys.list(me);
+  }
+
+  // GET /api/api-keys/usage — per-key post-creation rollups (admin-only).
+  @Get("usage")
+  usage(@CurrentProfile() me: any) {
+    return this.apiKeys.usage(me);
+  }
+
+  // GET /api/api-keys/activity — API-created posts + usage rollups (admin-only).
+  @Get("activity")
+  activity(@CurrentProfile() me: any, @Query() query: any) {
+    return this.apiKeys.activity(me, query);
   }
 
   // POST /api/api-keys — returns { ...key, key: "pp_live_…" } exactly once.

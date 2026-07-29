@@ -104,6 +104,46 @@ export class Sport {
   created_at: Date;
 }
 
+// Reusable image-generation prompt templates ("Design Templates"). A shared
+// library of parameterized prompts (with {placeholders}); seeded with defaults
+// on first read. Separate from the text `templates` (caption/hashtag) feature.
+@Entity("design_templates")
+export class DesignTemplate {
+  @PrimaryGeneratedColumn("uuid")
+  id: string;
+
+  @Column()
+  name: string;
+
+  @Column({ type: "text", nullable: true })
+  description: string | null;
+
+  @Column({ type: "text" })
+  prompt: string;
+
+  @Column({ type: "text", array: true, default: () => "'{}'" })
+  tags: string[];
+
+  @Column({ name: "story_types", type: "text", array: true, default: () => "'{}'" })
+  story_types: string[];
+
+  // Stable key for seeded library items (e.g. "version_b"); null for custom ones.
+  @Column({ name: "template_key", type: "text", nullable: true })
+  template_key: string | null;
+
+  @Column({ name: "is_default", default: false })
+  is_default: boolean;
+
+  @Column({ name: "created_by", type: "uuid", nullable: true })
+  created_by: string | null;
+
+  @CreateDateColumn({ name: "created_at", type: "timestamptz" })
+  created_at: Date;
+
+  @UpdateDateColumn({ name: "updated_at", type: "timestamptz" })
+  updated_at: Date;
+}
+
 // ── Connected social accounts ────────────────────────────────────────────
 @Entity("social_accounts")
 @Unique(["user_id", "platform", "external_account_id"])
@@ -239,6 +279,30 @@ export class ScheduledPost {
   @Column({ name: "approval_status", type: "text", default: "none" })
   approval_status: string; // none | pending | approved | rejected
 
+  // Optional fact-check verdict attached at approval time when the gate is on:
+  // { action: "pass"|"flag"|"block", reason, verdict, mode, checked, at }.
+  // Null when the gate is off or the post was never reviewed.
+  @Column({ name: "fact_check", type: "jsonb", nullable: true })
+  fact_check: Record<string, any> | null;
+
+  // When set (and auto-approve is enabled), the auto-approve cron approves this
+  // pending_review post once this time passes, unless a human acts first.
+  @Column({ name: "auto_approve_at", type: "timestamptz", nullable: true })
+  auto_approve_at: Date | null;
+
+  // How this post entered the system: "app" (composer, the default), "api"
+  // (external Developer API /api/v1), "csv" (bulk import), or "recycle" (clone).
+  // Powers the API Activity view and per-key usage tracking.
+  @Index()
+  @Column({ name: "source", type: "text", default: "app" })
+  source: string;
+
+  // When source = "api", the Developer API key (api_keys.id) that created this
+  // post — resolved to a name in the UI. Null for every non-API source.
+  @Index()
+  @Column({ name: "api_key_id", type: "uuid", nullable: true })
+  api_key_id: string | null;
+
   @Column({ name: "created_by", type: "uuid", nullable: true })
   created_by: string | null;
 
@@ -315,8 +379,19 @@ export class PostInsight {
   @Column({ type: "int", nullable: true }) comments: number | null;
   @Column({ type: "int", nullable: true }) shares: number | null;
   @Column({ type: "int", nullable: true }) reactions: number | null;
-  @Column({ type: "int", nullable: true }) clicks: number | null;
+  @Column({ type: "int", nullable: true }) clicks: number | null; // link/post clicks
   @Column({ name: "video_views", type: "int", nullable: true }) video_views: number | null;
+
+  // Detailed per-post metrics for the Post Analytics table. All nullable — a
+  // metric a platform doesn't expose stays null and renders as "N/A".
+  @Column({ type: "int", nullable: true }) saves: number | null; // IG saved
+  @Column({ name: "total_interactions", type: "int", nullable: true }) total_interactions: number | null;
+  @Column({ name: "three_second_views", type: "int", nullable: true }) three_second_views: number | null;
+  @Column({ name: "video_watch_time", type: "bigint", nullable: true }) video_watch_time: number | null; // seconds, total
+  @Column({ name: "video_avg_time", type: "numeric", nullable: true }) video_avg_time: number | null; // seconds, per view
+  @Column({ type: "int", nullable: true }) viewers: number | null; // unique viewers (≈ reach on FB)
+  @Column({ type: "int", nullable: true }) follows: number | null; // follows attributed to the post
+  @Column({ type: "int", nullable: true }) replies: number | null; // Threads/X replies
 
   @Column({ name: "engagement_rate", type: "numeric", nullable: true })
   engagement_rate: number | null;
@@ -610,6 +685,7 @@ export const ALL_ENTITIES = [
   Profile,
   Division,
   Sport,
+  DesignTemplate,
   SocialAccount,
   ScheduledPost,
   PostTarget,

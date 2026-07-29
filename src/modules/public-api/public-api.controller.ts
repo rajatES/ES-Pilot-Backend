@@ -15,7 +15,7 @@ import { FileInterceptor } from "@nestjs/platform-express";
 import { PublicApiService } from "./public-api.service";
 import { ApiKeyGuard } from "./api-key.guard";
 import { Public } from "../../auth/public.decorator";
-import { CurrentProfile } from "../../auth/current-user.decorator";
+import { CurrentProfile, CurrentApiKey } from "../../auth/current-user.decorator";
 
 // External Developer API — /api/v1/*. @Public() opts out of the global JWT
 // guard; ApiKeyGuard authenticates with a key from Settings → API Keys.
@@ -35,8 +35,8 @@ export class PublicApiController {
   // POST /api/v1/posts — create a post (publish now / schedule / queue / review / draft).
   @Post("posts")
   @HttpCode(201)
-  createPost(@Body() body: any, @CurrentProfile() profile: any) {
-    return this.api.createPost(body, profile);
+  createPost(@Body() body: any, @CurrentProfile() profile: any, @CurrentApiKey() apiKey: any) {
+    return this.api.createPost(body, profile, apiKey);
   }
 
   // GET /api/v1/posts — recent posts with per-account delivery status.

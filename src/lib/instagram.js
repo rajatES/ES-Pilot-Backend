@@ -160,26 +160,48 @@ export async function getInstagramPostMetrics({ account, externalPostId }) {
     likes: data.like_count ?? 0,
     comments: data.comments_count ?? 0,
     shares: 0,
-    impressions: null,
+    impressions: null, // "Views"
     reach: null,
+    viewers: null, // unique viewers ≈ reach on IG
+    saves: null,
+    total_interactions: null,
+    video_watch_time: null, // seconds, total
+    video_avg_time: null, // seconds, per view
     raw: data
   };
 
   try {
     // "views" replaced "impressions" for media created after mid-2024.
     const iRes = await fetch(
-      `${GRAPH}/${externalPostId}/insights?metric=reach,views,shares&access_token=${account.access_token}`
+      `${GRAPH}/${externalPostId}/insights?metric=reach,views,saved,shares,total_interactions&access_token=${account.access_token}`
     );
     const iData = await iRes.json();
     if (iRes.ok) {
       for (const m of iData.data || []) {
         const v = m.values?.[0]?.value;
-        if (m.name === "reach") metrics.reach = v ?? null;
+        if (m.name === "reach") { metrics.reach = v ?? null; metrics.viewers = v ?? null; }
         if (m.name === "views") metrics.impressions = v ?? null;
+        if (m.name === "saved") metrics.saves = v ?? null;
         if (m.name === "shares") metrics.shares = v ?? 0;
+        if (m.name === "total_interactions") metrics.total_interactions = v ?? null;
       }
     }
   } catch { /* insights are optional — token may lack instagram_manage_insights */ }
+
+  // Reels watch-time metrics (separate call — non-reel media rejects them).
+  try {
+    const vRes = await fetch(
+      `${GRAPH}/${externalPostId}/insights?metric=ig_reels_video_view_total_time,ig_reels_avg_watch_time&access_token=${account.access_token}`
+    );
+    const vData = await vRes.json();
+    if (vRes.ok) {
+      for (const m of vData.data || []) {
+        const v = m.values?.[0]?.value;
+        if (m.name === "ig_reels_video_view_total_time") metrics.video_watch_time = v != null ? Math.round(v / 1000) : null;
+        if (m.name === "ig_reels_avg_watch_time") metrics.video_avg_time = v != null ? +(v / 1000).toFixed(1) : null;
+      }
+    }
+  } catch { /* not a reel, or metric unavailable */ }
 
   return metrics;
 }

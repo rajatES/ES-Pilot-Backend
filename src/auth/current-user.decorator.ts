@@ -10,3 +10,10 @@ export const CurrentUser = createParamDecorator((_data: unknown, ctx: ExecutionC
 export const CurrentProfile = createParamDecorator((_data: unknown, ctx: ExecutionContext) => {
   return ctx.switchToHttp().getRequest().profile;
 });
+
+// Injects the Developer API key row attached by ApiKeyGuard on /api/v1/* routes
+// (undefined on JWT routes). Lets external post-creation record which key made a
+// post — see PublicApiService.createPost.
+export const CurrentApiKey = createParamDecorator((_data: unknown, ctx: ExecutionContext) => {
+  return ctx.switchToHttp().getRequest().apiKey;
+});

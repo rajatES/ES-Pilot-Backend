@@ -9,10 +9,20 @@ import { publishYouTubeVideo, checkYouTubeVideoStatus, getYouTubeVideoAnalytics 
 import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
 import { postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
+import { ApprovalsService } from "../approvals/approvals.service";
 
 @Injectable()
 export class CronService {
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly supabaseService: SupabaseService,
+    private readonly approvals: ApprovalsService,
+  ) {}
+
+  // Auto-approve pending_review posts whose auto_approve_at has elapsed.
+  async autoApprove(req: any) {
+    this.authorize(req);
+    return this.approvals.autoApproveDue();
+  }
 
   // Cron endpoints authenticate with a shared CRON_SECRET (Bearer header or
   // ?secret=), NOT a user session.

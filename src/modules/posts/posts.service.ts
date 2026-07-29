@@ -48,27 +48,42 @@ export class PostsService {
   async list() {
     const supabase = this.supabaseService.createServiceClient();
 
-    const [{ data: accounts, error: accountsError }, { data: posts, error: postsError }, { data: authors }] =
-      await Promise.all([
-        supabase
-          .from("social_accounts")
-          .select("*")
-          .eq("user_id", OWNER_ID)
-          .order("created_at", { ascending: false }),
-        supabase
-          .from("scheduled_posts")
-          .select("*, post_targets(*, social_accounts(id, display_name, platform, avatar_url))")
-          .eq("user_id", OWNER_ID)
-          .order("scheduled_for", { ascending: false })
-          .limit(100),
-        supabase.from("profiles").select("id, display_name, email, division_id"),
-      ]);
+    const [
+      { data: accounts, error: accountsError },
+      { data: posts, error: postsError },
+      { data: authors },
+      { data: apiKeyRows },
+    ] = await Promise.all([
+      supabase
+        .from("social_accounts")
+        .select("*")
+        .eq("user_id", OWNER_ID)
+        .order("created_at", { ascending: false }),
+      supabase
+        .from("scheduled_posts")
+        .select("*, post_targets(*, social_accounts(id, display_name, platform, avatar_url))")
+        .eq("user_id", OWNER_ID)
+        .order("scheduled_for", { ascending: false })
+        .limit(100),
+      supabase.from("profiles").select("id, display_name, email, division_id"),
+      supabase.from("api_keys").select("*").order("created_at", { ascending: false }),
+    ]);
 
     if (accountsError || postsError) {
       throw new InternalServerErrorException(accountsError?.message || postsError?.message);
     }
 
-    return { accounts, posts, authors: authors || [] };
+    // Map API keys explicitly — the pg shim ignores column projection (always
+    // `select *`), and key_hash must never reach the client. Lets the UI resolve
+    // scheduled_posts.api_key_id → a human key name.
+    const apiKeys = (apiKeyRows || []).map((k: any) => ({
+      id: k.id,
+      name: k.name,
+      key_prefix: k.key_prefix,
+      revoked_at: k.revoked_at,
+    }));
+
+    return { accounts, posts, authors: authors || [], apiKeys };
   }
 
   async create(payload: any, author: any) {
@@ -87,8 +102,14 @@ export class PostsService {
       saveAs,
       platformCaptions,
       platformOptions: platformOptionsInput,
+      source,
+      apiKeyId,
     } = payload || {};
     const accountIds = Array.isArray(socialAccountIds) ? socialAccountIds : [];
+    // Origin: "app" (composer, default) unless a caller passes it — the external
+    // Developer API sets source:"api" + apiKeyId so posts are attributable.
+    const postSource = source || "app";
+    const postApiKeyId = apiKeyId || null;
     // Per-platform caption overrides / options (nullable jsonb columns).
     const pCaptions = sanitizePlatformCaptions(platformCaptions);
     const pOptions = sanitizePlatformOptions(platformOptionsInput);
@@ -124,6 +145,8 @@ export class PostsService {
           first_comment: firstComment || null,
           platform_captions: pCaptions,
           platform_options: pOptions,
+          source: postSource,
+          api_key_id: postApiKeyId,
           created_by: author?.id || null,
         })
         .select()
@@ -224,6 +247,8 @@ export class PostsService {
         first_comment: firstComment || null,
         platform_captions: pCaptions,
         platform_options: pOptions,
+        source: postSource,
+        api_key_id: postApiKeyId,
         created_by: author?.id || null,
         scheduled_for: (publishNow ? new Date() : scheduledDate).toISOString(),
         status: initialStatus,
@@ -570,6 +595,7 @@ export class PostsService {
         platform_options: post.platform_options || null,
         scheduled_for: when.toISOString(),
         status: "scheduled",
+        source: "recycle",
         created_by: author?.id || null,
       })
       .select()
@@ -690,6 +716,7 @@ export class PostsService {
           content_type: contentTypeRaw || null,
           scheduled_for: when.toISOString(),
           status: "scheduled",
+          source: "csv",
           created_by: author?.id || null,
         })
         .select()

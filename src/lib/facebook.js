@@ -269,24 +269,51 @@ export async function getFacebookPostMetrics({ account, externalPostId }) {
     likes: data.likes?.summary?.total_count ?? 0,
     comments: data.comments?.summary?.total_count ?? 0,
     shares: data.shares?.count ?? 0,
-    impressions: null,
-    reach: null,
+    impressions: null, // "Views" — total content views
+    reach: null, // unique accounts reached
+    viewers: null, // unique viewers (Meta merged this with reach in 2026)
+    clicks: null, // post/link clicks
+    three_second_views: null,
+    video_watch_time: null, // seconds, total
+    video_avg_time: null, // seconds, per view
     raw: data
   };
 
+  // Core post insights. NOTE: post_impressions / post_impressions_unique were
+  // retired by Meta in June 2026. post_media_view (total content views) and
+  // post_total_media_view_unique (unique viewers ≈ reach) replace them and are
+  // populated for ALL post types; post_clicks is still valid.
   try {
     const iRes = await fetch(
-      `${GRAPH}/${externalPostId}/insights?metric=post_impressions,post_impressions_unique&access_token=${account.access_token}`
+      `${GRAPH}/${externalPostId}/insights?metric=post_media_view,post_total_media_view_unique,post_clicks&access_token=${account.access_token}`
     );
     const iData = await iRes.json();
     if (iRes.ok) {
       for (const m of iData.data || []) {
         const v = m.values?.[0]?.value;
-        if (m.name === "post_impressions") metrics.impressions = v ?? null;
-        if (m.name === "post_impressions_unique") metrics.reach = v ?? null;
+        if (m.name === "post_media_view") metrics.impressions = v ?? null;
+        if (m.name === "post_total_media_view_unique") { metrics.reach = v ?? null; metrics.viewers = v ?? null; }
+        if (m.name === "post_clicks") metrics.clicks = v ?? null;
       }
     }
   } catch { /* insights are optional — token may lack read_insights */ }
+
+  // Video-only metrics, fetched separately so a non-video post (which rejects
+  // these metric names) doesn't fail the whole call. Meta returns milliseconds.
+  try {
+    const vRes = await fetch(
+      `${GRAPH}/${externalPostId}/insights?metric=post_video_views_3s,post_video_view_time,post_video_avg_time_watched&access_token=${account.access_token}`
+    );
+    const vData = await vRes.json();
+    if (vRes.ok) {
+      for (const m of vData.data || []) {
+        const v = m.values?.[0]?.value;
+        if (m.name === "post_video_views_3s") metrics.three_second_views = v ?? null;
+        if (m.name === "post_video_view_time") metrics.video_watch_time = v != null ? Math.round(v / 1000) : null;
+        if (m.name === "post_video_avg_time_watched") metrics.video_avg_time = v != null ? +(v / 1000).toFixed(1) : null;
+      }
+    }
+  } catch { /* not a video post, or metric unavailable */ }
 
   return metrics;
 }

@@ -26,6 +26,7 @@ function toApiPost(post: any) {
     contentType: post.content_type,
     platformCaptions: post.platform_captions || null,
     platformOptions: post.platform_options || null,
+    source: post.source || "app",
     status: post.status,
     approvalStatus: post.approval_status,
     scheduledFor: post.scheduled_for,
@@ -73,7 +74,7 @@ export class PublicApiService {
   }
 
   // POST /api/v1/posts — create + publish/schedule/queue/review/draft.
-  async createPost(payload: any, profile: any) {
+  async createPost(payload: any, profile: any, apiKey: any = null) {
     const p = payload || {};
 
     const content = (p.content ?? p.text ?? p.body ?? "").trim();
@@ -151,6 +152,10 @@ export class PublicApiService {
         // Optional per-platform overrides — sanitized/persisted by PostsService.
         platformCaptions: p.platformCaptions || null,
         platformOptions: p.platformOptions || null,
+        // Origin tracking — records that this post came in through the external
+        // Developer API and which key created it (see PostsService.create).
+        source: "api",
+        apiKeyId: apiKey?.id || null,
       },
       profile,
     );

@@ -276,6 +276,7 @@ export async function getThreadsPostMetrics({ account, externalPostId }) {
   return {
     likes: byName.likes ?? 0,
     comments: byName.replies ?? 0,
+    replies: byName.replies ?? null,
     // reposts + quotes are Threads' "shares" equivalent.
     shares: (byName.reposts ?? 0) + (byName.quotes ?? 0),
     impressions: byName.views ?? null,

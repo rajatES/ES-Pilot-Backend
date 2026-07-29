@@ -37,4 +37,13 @@ export class CronController {
   insightsPost(@Req() req: Request) {
     return this.cron.insights(req);
   }
+
+  @Get("auto-approve")
+  autoApproveGet(@Req() req: Request) {
+    return this.cron.autoApprove(req);
+  }
+  @Post("auto-approve")
+  autoApprovePost(@Req() req: Request) {
+    return this.cron.autoApprove(req);
+  }
 }
