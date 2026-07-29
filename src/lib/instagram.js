@@ -197,6 +197,42 @@ export async function getInstagramPostMetrics({ account, externalPostId }) {
   return metrics;
 }
 
+// Lists media on the IG business account, newest first, within [since, until].
+// The media edge has no reliable since/until, so we paginate and stop once we
+// pass `since`. Returns raw Graph media objects; never throws.
+export async function listInstagramMedia({ account, since, until, max = 200 }) {
+  if (isMockMode()) return [];
+  if (!account.access_token || !account.external_account_id) return [];
+  const sinceMs = since ? new Date(since).getTime() : 0;
+  const untilMs = until ? new Date(until).getTime() : Infinity;
+  const fields = "id,caption,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp,comments_count,like_count";
+  let url = `${GRAPH}/${account.external_account_id}/media?fields=${fields}&limit=25&access_token=${account.access_token}`;
+
+  const out = [];
+  try {
+    while (url && out.length < max) {
+      const res = await fetch(url);
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        console.warn(`[instagram] listMedia ${account.display_name || account.external_account_id}:`, data?.error?.message || res.status);
+        break;
+      }
+      let reachedOlder = false;
+      for (const m of data.data || []) {
+        const t = m.timestamp ? new Date(m.timestamp).getTime() : 0;
+        if (t && t < sinceMs) { reachedOlder = true; continue; }
+        if (t && t > untilMs) continue;
+        out.push(m);
+      }
+      if (reachedOlder) break; // newest-first: once older than the window, stop paging
+      url = data.paging?.next || null;
+    }
+  } catch (e) {
+    console.warn(`[instagram] listMedia error for ${account.display_name || account.external_account_id}:`, e.message);
+  }
+  return out.slice(0, max);
+}
+
 // Check whether a published Instagram post still exists.
 // Returns { exists: true } | { exists: false } | { exists: null, error }
 export async function checkInstagramPostStatus({ account, externalPostId }) {

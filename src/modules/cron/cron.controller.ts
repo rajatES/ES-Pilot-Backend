@@ -46,4 +46,13 @@ export class CronController {
   autoApprovePost(@Req() req: Request) {
     return this.cron.autoApprove(req);
   }
+
+  @Get("sync-posts")
+  syncPostsGet(@Req() req: Request) {
+    return this.cron.syncPosts(req);
+  }
+  @Post("sync-posts")
+  syncPostsPost(@Req() req: Request) {
+    return this.cron.syncPosts(req);
+  }
 }

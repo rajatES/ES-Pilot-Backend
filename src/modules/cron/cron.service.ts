@@ -10,18 +10,28 @@ import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
 import { postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
 import { ApprovalsService } from "../approvals/approvals.service";
+import { SocialSyncService } from "../insights/social-sync.service";
 
 @Injectable()
 export class CronService {
   constructor(
     private readonly supabaseService: SupabaseService,
     private readonly approvals: ApprovalsService,
+    private readonly socialSync: SocialSyncService,
   ) {}
 
   // Auto-approve pending_review posts whose auto_approve_at has elapsed.
   async autoApprove(req: any) {
     this.authorize(req);
     return this.approvals.autoApproveDue();
+  }
+
+  // Sync ALL posts (organic + app-made) from connected FB/IG pages into
+  // social_posts. Runs on the CRON_SECRET, so no user session — passes me=null.
+  async syncPosts(req: any) {
+    this.authorize(req);
+    const days = Math.min(Math.max(Number(req.query?.days) || 90, 1), 365);
+    return this.socialSync.sync(null, { days });
   }
 
   // Cron endpoints authenticate with a shared CRON_SECRET (Bearer header or

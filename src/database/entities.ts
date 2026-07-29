@@ -403,6 +403,80 @@ export class PostInsight {
   raw: Record<string, any>;
 }
 
+// ── Synced page content ──────────────────────────────────────────────────
+// Every real post on a connected page/account, pulled from the platform's
+// Graph edge (not just posts published through this app). Powers the "all
+// posts" mode of Post Analytics. Metrics live on the row (refreshed by sync).
+@Entity("social_posts")
+@Unique(["social_account_id", "external_post_id"])
+export class SocialPost {
+  @PrimaryGeneratedColumn("uuid")
+  id: string;
+
+  @Index()
+  @Column({ name: "social_account_id", type: "uuid" })
+  social_account_id: string;
+
+  @Column()
+  platform: string;
+
+  @Index()
+  @Column({ name: "external_post_id", type: "text" })
+  external_post_id: string;
+
+  @Column({ name: "post_type", type: "text", nullable: true })
+  post_type: string | null; // photo | video | link | status | reel | story | carousel
+
+  @Column({ type: "text", nullable: true })
+  message: string | null;
+
+  @Column({ name: "media_url", type: "text", nullable: true })
+  media_url: string | null;
+
+  @Column({ name: "thumbnail_url", type: "text", nullable: true })
+  thumbnail_url: string | null;
+
+  @Column({ type: "text", nullable: true })
+  permalink: string | null;
+
+  @Index()
+  @Column({ name: "posted_at", type: "timestamptz", nullable: true })
+  posted_at: Date | null;
+
+  @Column({ name: "is_published", default: true })
+  is_published: boolean;
+
+  @Column({ name: "author_name", type: "text", nullable: true })
+  author_name: string | null;
+
+  @Column({ type: "int", nullable: true }) likes: number | null;
+  @Column({ type: "int", nullable: true }) comments: number | null;
+  @Column({ type: "int", nullable: true }) shares: number | null;
+  @Column({ type: "int", nullable: true }) reach: number | null;
+  @Column({ type: "int", nullable: true }) impressions: number | null; // views
+  @Column({ type: "int", nullable: true }) viewers: number | null;
+  @Column({ type: "int", nullable: true }) saves: number | null;
+  @Column({ type: "int", nullable: true }) clicks: number | null;
+  @Column({ name: "total_interactions", type: "int", nullable: true }) total_interactions: number | null;
+  @Column({ name: "three_second_views", type: "int", nullable: true }) three_second_views: number | null;
+  @Column({ name: "video_watch_time", type: "bigint", nullable: true }) video_watch_time: number | null;
+  @Column({ name: "video_avg_time", type: "numeric", nullable: true }) video_avg_time: number | null;
+  @Column({ type: "int", nullable: true }) replies: number | null;
+  @Column({ type: "int", nullable: true }) follows: number | null;
+
+  @Column({ name: "fetched_at", type: "timestamptz", nullable: true })
+  fetched_at: Date | null;
+
+  @Column({ type: "jsonb", default: () => "'{}'::jsonb" })
+  raw: Record<string, any>;
+
+  @CreateDateColumn({ name: "created_at", type: "timestamptz" })
+  created_at: Date;
+
+  @UpdateDateColumn({ name: "updated_at", type: "timestamptz" })
+  updated_at: Date;
+}
+
 // ── Posting queues (weekly time slots per account) ───────────────────────
 @Entity("posting_slots")
 @Unique(["social_account_id", "weekday", "time_of_day"])
@@ -690,6 +764,7 @@ export const ALL_ENTITIES = [
   ScheduledPost,
   PostTarget,
   PostInsight,
+  SocialPost,
   PostingSlot,
   Template,
   MediaFolder,

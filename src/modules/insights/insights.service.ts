@@ -148,6 +148,9 @@ export class InsightsService {
     }
 
     const rows: any[] = [];
+    const byKey: Record<string, any> = {}; // `${platform}:${externalPostId}` → row, for dedup/merge
+
+    // ── App-made posts (every platform) ──
     for (const p of posts || []) {
       const postType = this.derivePostType(p);
       for (const t of p.post_targets || []) {
@@ -159,14 +162,13 @@ export class InsightsService {
         const shares = ins?.shares ?? null;
         const saves = ins?.saves ?? null;
         const reach = ins?.reach ?? null;
-        // "Interactions" — platform-reported when available, else derived.
         const interactions =
           ins?.total_interactions ??
           (ins ? (likes || 0) + (comments || 0) + (shares || 0) + (saves || 0) : null);
         const engagement = (likes || 0) + (comments || 0) + (shares || 0);
         const engagementRate = ins?.engagement_rate ?? (reach ? +((engagement / reach) * 100).toFixed(2) : null);
 
-        rows.push({
+        const row = {
           rowId: `${p.id}:${t.id}`,
           postId: p.id,
           targetId: t.id,
@@ -182,6 +184,7 @@ export class InsightsService {
           postType,
           platformOptions: p.platform_options || null,
           source: p.source || "app",
+          origin: "app",
           datePublished: t.sent_at || p.sent_at || p.scheduled_for,
           status: t.status,
           createdBy: p.created_by || null,
@@ -203,11 +206,97 @@ export class InsightsService {
             avgPlayTime: ins?.video_avg_time != null ? Number(ins.video_avg_time) : null,
             engagementRate,
           },
-        });
+        };
+        rows.push(row);
+        byKey[`${row.platform}:${row.externalPostId}`] = row;
       }
     }
 
+    // ── Synced page content (FB/IG, organic + app) ──
+    // A synced post that matches an app-made target upgrades that row's metrics
+    // (the sync is the freshest, page-authoritative pull); one with no match
+    // becomes an "organic" row (posted outside this app).
+    let sq = supabase
+      .from("social_posts")
+      .select("*")
+      .gte("posted_at", sinceIso)
+      .order("posted_at", { ascending: false })
+      .limit(2000);
+    if (untilIso) sq = sq.lte("posted_at", untilIso);
+    const { data: socialPosts } = await sq;
+
+    if (socialPosts && socialPosts.length) {
+      const { data: accts } = await supabase
+        .from("social_accounts")
+        .select("id, display_name, platform, category, avatar_url")
+        .eq("user_id", OWNER_ID);
+      const acctById: Record<string, any> = {};
+      for (const a of accts || []) acctById[a.id] = a;
+
+      for (const sp of socialPosts) {
+        const metrics = this.socialMetrics(sp);
+        const existing = byKey[`${sp.platform}:${sp.external_post_id}`];
+        if (existing) {
+          existing.metrics = metrics;
+          existing.hasInsights = true;
+        } else {
+          const acct = acctById[sp.social_account_id] || {};
+          rows.push({
+            rowId: `sp:${sp.id}`,
+            postId: null,
+            targetId: null,
+            platform: sp.platform,
+            page: acct.display_name || sp.author_name || "Unknown",
+            accountId: sp.social_account_id,
+            category: acct.category || "Other",
+            avatarUrl: acct.avatar_url || null,
+            title: sp.message || "",
+            thumbnailUrl: sp.thumbnail_url || sp.media_url || null,
+            externalPostId: sp.external_post_id,
+            contentType: null,
+            postType: sp.post_type || "status",
+            platformOptions: null,
+            source: "organic",
+            origin: "organic",
+            datePublished: sp.posted_at,
+            status: sp.is_published === false ? "unpublished" : "sent",
+            createdBy: null,
+            hasInsights: true,
+            metrics,
+          });
+        }
+      }
+    }
+
+    // Newest first across the merged set.
+    rows.sort((a, b) => new Date(b.datePublished || 0).getTime() - new Date(a.datePublished || 0).getTime());
+
     return { rows, count: rows.length };
+  }
+
+  // Metrics object from a social_posts row — same shape as the app-row metrics.
+  private socialMetrics(sp: any) {
+    const likes = sp.likes ?? null, comments = sp.comments ?? null, shares = sp.shares ?? null, saves = sp.saves ?? null;
+    const reach = sp.reach ?? null;
+    const interactions = sp.total_interactions ?? ((likes || 0) + (comments || 0) + (shares || 0) + (saves || 0));
+    const engagement = (likes || 0) + (comments || 0) + (shares || 0);
+    return {
+      views: sp.impressions ?? null,
+      reach,
+      viewers: sp.viewers ?? null,
+      interactions,
+      likes,
+      comments,
+      shares,
+      saves,
+      linkClicks: sp.clicks ?? null,
+      replies: sp.replies ?? null,
+      follows: sp.follows ?? null,
+      threeSecondViews: sp.three_second_views ?? null,
+      watchTime: sp.video_watch_time != null ? Number(sp.video_watch_time) : null,
+      avgPlayTime: sp.video_avg_time != null ? Number(sp.video_avg_time) : null,
+      engagementRate: reach ? +((engagement / reach) * 100).toFixed(2) : null,
+    };
   }
 
   // Coarse content type for the type filter, from the stored media array.

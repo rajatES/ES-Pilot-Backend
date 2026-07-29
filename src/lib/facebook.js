@@ -307,6 +307,40 @@ export async function getFacebookPostMetrics({ account, externalPostId }) {
   return metrics;
 }
 
+// Lists posts published BY the page (organic + app-made), newest first, within
+// [since, until]. Uses the published_posts edge (needs pages_read_engagement,
+// which the app holds). Returns raw Graph post objects; never throws.
+export async function listFacebookPagePosts({ account, since, until, max = 200 }) {
+  if (isMockMode()) return [];
+  if (!account.access_token || !account.external_account_id) return [];
+  const sinceUnix = since ? Math.floor(new Date(since).getTime() / 1000) : "";
+  const untilUnix = until ? Math.floor(new Date(until).getTime() / 1000) : "";
+  const fields =
+    "id,message,story,created_time,status_type,permalink_url,full_picture,is_published," +
+    "shares,comments.summary(true).limit(0),likes.summary(true).limit(0),from,attachments{media_type,media,url,type}";
+  let url =
+    `${GRAPH}/${account.external_account_id}/published_posts?fields=${encodeURIComponent(fields)}&limit=25` +
+    `${sinceUnix ? `&since=${sinceUnix}` : ""}${untilUnix ? `&until=${untilUnix}` : ""}` +
+    `&access_token=${account.access_token}`;
+
+  const out = [];
+  try {
+    while (url && out.length < max) {
+      const res = await fetch(url);
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        console.warn(`[facebook] listPagePosts ${account.display_name || account.external_account_id}:`, data?.error?.message || res.status);
+        break;
+      }
+      if (Array.isArray(data.data)) out.push(...data.data);
+      url = data.paging?.next || null;
+    }
+  } catch (e) {
+    console.warn(`[facebook] listPagePosts error for ${account.display_name || account.external_account_id}:`, e.message);
+  }
+  return out.slice(0, max);
+}
+
 // Check whether a published/scheduled post still exists on Facebook.
 // Returns { exists: true, isPublished } | { exists: false } | { exists: null, error }
 // (null = couldn't determine — e.g. expired token — so callers shouldn't flag it).
