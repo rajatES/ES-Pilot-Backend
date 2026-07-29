@@ -747,6 +747,20 @@ export class PostsService {
     return { created, errors };
   }
 
+  // Best-effort first comment for a Facebook post that just went live via the
+  // native scheduler (reached only from verify() when a scheduled FB target
+  // flips to sent). Mirrors the immediate-publish first-comment behaviour and,
+  // like it, never fails the reconciliation itself. Gated on target.status ===
+  // "scheduled" at the call sites, so it runs exactly once per target.
+  private async postFacebookFirstComment(account: any, post: any, externalPostId: string) {
+    if (!post?.first_comment?.trim() || !externalPostId) return;
+    try {
+      await postFacebookComment({ account, postId: externalPostId, message: post.first_comment });
+    } catch (e: any) {
+      console.warn(`[verify] first comment failed for ${account.display_name}:`, e.message);
+    }
+  }
+
   // POST /api/posts/verify — reconcile recent posts against the FB Graph API.
   async verify() {
     const supabase = this.supabaseService.createServiceClient();
@@ -754,7 +768,7 @@ export class PostsService {
     const { data: posts, error } = await supabase
       .from("scheduled_posts")
       .select(
-        "id, body, status, sent_at, scheduled_for, post_targets(id, status, external_post_id, social_accounts(id, display_name, access_token, platform, external_account_id))",
+        "id, body, first_comment, status, sent_at, scheduled_for, post_targets(id, status, external_post_id, social_accounts(id, display_name, access_token, platform, external_account_id))",
       )
       .eq("user_id", OWNER_ID)
       .in("status", ["sent", "scheduled", "publishing"])
@@ -843,6 +857,12 @@ export class PostsService {
           targetStatuses.push("sent");
           published++;
           postChanged = true;
+          // The post just went live via the native scheduler — this is the only
+          // moment we can post its first comment (the immediate-publish paths
+          // never ran for it). FB only; YouTube has no first-comment support here.
+          if (account.platform === "facebook") {
+            await this.postFacebookFirstComment(account, post, target.external_post_id);
+          }
           await logActivity({
             type: "post.published",
             title: `Scheduled post went live — ${account.display_name}`,
@@ -870,6 +890,8 @@ export class PostsService {
             targetStatuses.push("sent");
             published++;
             postChanged = true;
+            // Recovered a stuck dark post — now that it's live, post its first comment.
+            await this.postFacebookFirstComment(account, post, target.external_post_id);
             await logActivity({
               type: "post.published",
               title: `Recovered a stuck scheduled post — ${account.display_name}`,
