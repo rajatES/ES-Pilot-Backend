@@ -95,7 +95,13 @@ export class SocialService {
         account_type: platform === "instagram" ? "business" : "page",
         external_account_id: page.id,
         display_name: page.name,
-        avatar_url: page.picture || null,
+        // FB page pictures from the API are expiring scontent URLs; store the
+        // stable, non-expiring picture endpoint instead. IG has no such stable
+        // public URL, so keep what the API gave (the UI falls back gracefully).
+        avatar_url:
+          platform === "facebook"
+            ? `https://graph.facebook.com/${page.id}/picture?type=square`
+            : page.picture || null,
         access_token: page.access_token,
         token_expires_at: expiresAt,
         category: detectSport(page.name),
