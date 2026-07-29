@@ -1,4 +1,6 @@
 // Keep the Graph version in lockstep with lib/instagram.js and lib/facebookOAuth.js.
+import { fetchInsightsResilient } from "./metaInsights";
+
 const GRAPH = "https://graph.facebook.com/v23.0";
 
 // Mock unless explicitly "live" (case-insensitive), so a fresh checkout never
@@ -279,41 +281,28 @@ export async function getFacebookPostMetrics({ account, externalPostId }) {
     raw: data
   };
 
-  // Core post insights. NOTE: post_impressions / post_impressions_unique were
-  // retired by Meta in June 2026. post_media_view (total content views) and
-  // post_total_media_view_unique (unique viewers ≈ reach) replace them and are
-  // populated for ALL post types; post_clicks is still valid.
-  try {
-    const iRes = await fetch(
-      `${GRAPH}/${externalPostId}/insights?metric=post_media_view,post_total_media_view_unique,post_clicks&access_token=${account.access_token}`
-    );
-    const iData = await iRes.json();
-    if (iRes.ok) {
-      for (const m of iData.data || []) {
-        const v = m.values?.[0]?.value;
-        if (m.name === "post_media_view") metrics.impressions = v ?? null;
-        if (m.name === "post_total_media_view_unique") { metrics.reach = v ?? null; metrics.viewers = v ?? null; }
-        if (m.name === "post_clicks") metrics.clicks = v ?? null;
-      }
-    }
-  } catch { /* insights are optional — token may lack read_insights */ }
+  // Core post insights. post_impressions / post_impressions_unique were retired
+  // by Meta in June 2026 → post_media_view (total content views) and
+  // post_total_media_view_unique (unique viewers ≈ reach); post_clicks = clicks.
+  // Resilient: if one metric is rejected for this post type, the others still land.
+  for (const m of await fetchInsightsResilient(
+    GRAPH, externalPostId, ["post_media_view", "post_total_media_view_unique", "post_clicks"], account.access_token,
+  )) {
+    const v = m.values?.[0]?.value;
+    if (m.name === "post_media_view") metrics.impressions = v ?? null;
+    if (m.name === "post_total_media_view_unique") { metrics.reach = v ?? null; metrics.viewers = v ?? null; }
+    if (m.name === "post_clicks") metrics.clicks = v ?? null;
+  }
 
-  // Video-only metrics, fetched separately so a non-video post (which rejects
-  // these metric names) doesn't fail the whole call. Meta returns milliseconds.
-  try {
-    const vRes = await fetch(
-      `${GRAPH}/${externalPostId}/insights?metric=post_video_views_3s,post_video_view_time,post_video_avg_time_watched&access_token=${account.access_token}`
-    );
-    const vData = await vRes.json();
-    if (vRes.ok) {
-      for (const m of vData.data || []) {
-        const v = m.values?.[0]?.value;
-        if (m.name === "post_video_views_3s") metrics.three_second_views = v ?? null;
-        if (m.name === "post_video_view_time") metrics.video_watch_time = v != null ? Math.round(v / 1000) : null;
-        if (m.name === "post_video_avg_time_watched") metrics.video_avg_time = v != null ? +(v / 1000).toFixed(1) : null;
-      }
-    }
-  } catch { /* not a video post, or metric unavailable */ }
+  // Video-only metrics (empty for non-video posts). Meta returns milliseconds.
+  for (const m of await fetchInsightsResilient(
+    GRAPH, externalPostId, ["post_video_views_3s", "post_video_view_time", "post_video_avg_time_watched"], account.access_token,
+  )) {
+    const v = m.values?.[0]?.value;
+    if (m.name === "post_video_views_3s") metrics.three_second_views = v ?? null;
+    if (m.name === "post_video_view_time") metrics.video_watch_time = v != null ? Math.round(v / 1000) : null;
+    if (m.name === "post_video_avg_time_watched") metrics.video_avg_time = v != null ? +(v / 1000).toFixed(1) : null;
+  }
 
   return metrics;
 }

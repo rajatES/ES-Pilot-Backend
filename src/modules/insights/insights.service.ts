@@ -219,13 +219,24 @@ export class InsightsService {
     return "text";
   }
 
-  // POST /api/insights/refresh { postId? } — fetch live metrics by post id via
-  // the platform APIs and upsert post_insights. Scoped to one post, or the
-  // recent sent set when no postId is given.
+  // POST /api/insights/refresh { postId?, days?, start?, end? } — fetch live
+  // metrics by post id via the platform APIs and upsert post_insights. Scoped to
+  // one post, or the sent set within a window. The window MUST match what the
+  // caller is viewing: the Post Analytics page passes its own range so posts
+  // older than 30 days still get refreshed (otherwise their Reach/Views stay
+  // blank even though the row is shown).
   async refresh(body: any) {
     const supabase = this.supabaseService.createServiceClient();
     const postId = body?.postId || null;
-    const since = new Date(Date.now() - 30 * 86400000).toISOString();
+    const days = Math.min(Math.max(Number(body?.days) || 30, 1), 365);
+    let sinceIso: string;
+    let untilIso: string | null = null;
+    if (body?.start && body?.end) {
+      sinceIso = new Date(`${body.start}T00:00:00.000Z`).toISOString();
+      untilIso = new Date(`${body.end}T23:59:59.999Z`).toISOString();
+    } else {
+      sinceIso = new Date(Date.now() - days * 86400000).toISOString();
+    }
 
     let q = supabase
       .from("post_targets")
@@ -235,7 +246,12 @@ export class InsightsService {
       .eq("status", "sent")
       .in("platform", ["facebook", "instagram", "threads", "twitter", "youtube"])
       .not("external_post_id", "is", null);
-    q = postId ? q.eq("post_id", postId) : q.gte("sent_at", since).order("sent_at", { ascending: false }).limit(150);
+    if (postId) {
+      q = q.eq("post_id", postId);
+    } else {
+      q = q.gte("sent_at", sinceIso).order("sent_at", { ascending: false }).limit(500);
+      if (untilIso) q = q.lte("sent_at", untilIso);
+    }
 
     const { data: targets, error } = await q;
     if (error) throw new InternalServerErrorException(error.message);
