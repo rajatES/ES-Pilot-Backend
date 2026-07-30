@@ -19,6 +19,8 @@ export class UploadService {
     let mimeType = file.mimetype || "application/octet-stream";
     const originalName = file.originalname || "file";
     let safeName = originalName.replace(/[^a-zA-Z0-9._-]/g, "-");
+    const originalSizeBytes = buffer.byteLength;
+    let optimized = false;
 
     // Downscale/re-encode oversized images so platforms (esp. Facebook) don't
     // reject them with an opaque "Invalid parameter". No-op for in-limit
@@ -30,6 +32,7 @@ export class UploadService {
         buffer = opt.buffer;
         mimeType = opt.contentType;
         if (opt.ext) safeName = `${safeName.replace(/\.[^.]+$/, "")}.${opt.ext}`;
+        optimized = true;
       }
     } catch (e: any) {
       console.warn("[upload] image optimize skipped:", e?.message);
@@ -46,6 +49,10 @@ export class UploadService {
       filename: safeName,
       mimeType,
       sizeBytes: buffer.byteLength,
+      // `optimized` (+ the pre-optimization size) lets the UI tell the user the
+      // image was auto-downscaled to fit the platforms' limits.
+      optimized,
+      originalSizeBytes,
       hash,
     };
   }

@@ -1,4 +1,5 @@
 import { fetchInsightsResilient } from "./metaInsights";
+import { metaErrorMessage } from "./metaError";
 
 const GRAPH = "https://graph.facebook.com/v23.0";
 
@@ -23,7 +24,7 @@ async function createContainer(igUserId, accessToken, fields) {
     body: JSON.stringify({ ...fields, access_token: accessToken })
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(data?.error?.message || "Instagram media creation failed.");
+  if (!res.ok) throw new Error(metaErrorMessage(data, "Instagram media creation failed."));
   return data.id;
 }
 
@@ -34,7 +35,7 @@ async function waitForContainer(containerId, accessToken, { timeoutMs = 4 * 60 *
     const params = new URLSearchParams({ fields: "status_code,status", access_token: accessToken });
     const res = await fetch(`${GRAPH}/${containerId}?${params}`);
     const data = await res.json();
-    if (!res.ok) throw new Error(data?.error?.message || "Instagram container status check failed.");
+    if (!res.ok) throw new Error(metaErrorMessage(data, "Instagram container status check failed."));
     if (data.status_code === "FINISHED") return;
     if (data.status_code === "ERROR" || data.status_code === "EXPIRED") {
       throw new Error(data.status || `Instagram media processing ${data.status_code.toLowerCase()}.`);
@@ -51,7 +52,7 @@ async function publishContainer(igUserId, accessToken, creationId) {
     body: JSON.stringify({ creation_id: creationId, access_token: accessToken })
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(data?.error?.message || "Instagram publish failed.");
+  if (!res.ok) throw new Error(metaErrorMessage(data, "Instagram publish failed."));
   return data.id;
 }
 
@@ -137,7 +138,7 @@ export async function postInstagramComment({ account, mediaId, message }) {
     body: JSON.stringify({ message: message.trim(), access_token: account.access_token })
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(data?.error?.message || "Failed to post first comment.");
+  if (!res.ok) throw new Error(metaErrorMessage(data, "Failed to post first comment."));
   return { commentId: data.id };
 }
 
@@ -156,7 +157,7 @@ export async function getInstagramPostMetrics({ account, externalPostId }) {
   });
   const res = await fetch(`${GRAPH}/${externalPostId}?${params}`);
   const data = await res.json();
-  if (!res.ok) throw new Error(data?.error?.message || "Couldn't fetch Instagram metrics.");
+  if (!res.ok) throw new Error(metaErrorMessage(data, "Couldn't fetch Instagram metrics."));
 
   const metrics = {
     likes: data.like_count ?? 0,

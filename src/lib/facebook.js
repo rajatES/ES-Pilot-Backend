@@ -1,5 +1,6 @@
 // Keep the Graph version in lockstep with lib/instagram.js and lib/facebookOAuth.js.
 import { fetchInsightsResilient } from "./metaInsights";
+import { metaErrorMessage as fbErrorMessage } from "./metaError";
 
 const GRAPH = "https://graph.facebook.com/v23.0";
 
@@ -18,22 +19,6 @@ function mockPostId(prefix) {
 function appendLink(text, link) {
   if (!link || (text && text.includes(link))) return text;
   return text ? `${text}\n\n${link}` : link;
-}
-
-// Meta collapses many distinct failures into the generic "Invalid parameter"
-// (code 100) — useless on its own. The actionable reason lives in
-// error_user_title / error_user_msg / error_subcode (e.g. subcode 1366046 +
-// "Bad Image" when a photo/video URL can't be fetched). Surface those so a
-// failed post says WHY, not just "Invalid parameter". Falls back to
-// error.message, then the caller's default.
-function fbErrorMessage(data, fallback) {
-  const e = data?.error;
-  if (!e) return fallback;
-  const human = [e.error_user_title, e.error_user_msg].filter(Boolean).join(" — ");
-  const base = human || e.message || fallback;
-  const code = e.code != null ? `#${e.code}${e.error_subcode ? `/${e.error_subcode}` : ""}` : "";
-  const withCode = code && !base.includes(`#${e.code}`) ? `${base} (${code})` : base;
-  return e.fbtrace_id ? `${withCode} [trace ${e.fbtrace_id}]` : withCode;
 }
 
 // Normalize a post's media into the ordered [{url, type}] array. Older rows
