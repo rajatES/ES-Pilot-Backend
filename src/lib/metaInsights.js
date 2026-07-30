@@ -17,7 +17,7 @@ export async function fetchInsightsResilient(graphBase, objectId, metrics, acces
   try {
     const res = await fetch(build(metrics.join(",")));
     const data = await res.json();
-    if (res.ok) return data?.data || [];
+    if (res.ok) return preferLifetime(data?.data || []);
     const err = data?.error;
     // Only an invalid-metric error is salvageable by dropping the bad name(s).
     const invalidMetric = err?.code === 100 && /valid insights metric/i.test(err?.message || "");
@@ -36,5 +36,21 @@ export async function fetchInsightsResilient(graphBase, objectId, metrics, acces
       /* skip this metric */
     }
   }
-  return merged;
+  return preferLifetime(merged);
+}
+
+// The new "media view" metrics (post_media_view, post_total_media_view_unique,
+// …) can come back as TWO entries for one name — a `lifetime` total and a `day`
+// series whose values[0] is just the first day in the window. Callers read
+// values[0], so collapse duplicates to one entry per metric, keeping the
+// lifetime total when present. Order-independent (don't trust Meta's ordering).
+function preferLifetime(rows) {
+  const byName = new Map();
+  for (const r of rows) {
+    const existing = byName.get(r.name);
+    if (!existing || (r.period === "lifetime" && existing.period !== "lifetime")) {
+      byName.set(r.name, r);
+    }
+  }
+  return [...byName.values()];
 }

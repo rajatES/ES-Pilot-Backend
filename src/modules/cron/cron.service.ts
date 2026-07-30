@@ -9,6 +9,7 @@ import { publishYouTubeVideo, checkYouTubeVideoStatus, getYouTubeVideoAnalytics 
 import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
 import { postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
+import { buildPostInsightRow } from "../../lib/postInsightRow";
 import { ApprovalsService } from "../approvals/approvals.service";
 import { SocialSyncService } from "../insights/social-sync.service";
 
@@ -396,23 +397,8 @@ export class CronService {
         } else {
           m = await getFacebookPostMetrics({ account, externalPostId: target.external_post_id });
         }
-        const engagement = (m.likes || 0) + (m.comments || 0) + (m.shares || 0);
-        const engagementRate = m.reach ? +((engagement / m.reach) * 100).toFixed(2) : null;
-
         await supabase.from("post_insights").delete().eq("post_target_id", target.id);
-        await supabase.from("post_insights").insert({
-          post_target_id: target.id,
-          external_post_id: target.external_post_id,
-          platform: target.platform,
-          likes: m.likes,
-          comments: m.comments,
-          shares: m.shares,
-          impressions: m.impressions,
-          reach: m.reach,
-          engagement_rate: engagementRate,
-          fetched_at: new Date().toISOString(),
-          raw: m.raw || {},
-        });
+        await supabase.from("post_insights").insert(buildPostInsightRow(target, m));
         synced++;
       } catch (err) {
         failed++;

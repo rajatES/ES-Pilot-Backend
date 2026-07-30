@@ -10,6 +10,8 @@ import { getThreadsPostMetrics } from "../../lib/threads";
 import { getXPostMetrics } from "../../lib/x";
 // @ts-ignore
 import { getYouTubeVideoAnalytics } from "../../lib/youtube";
+// @ts-ignore
+import { buildPostInsightRow } from "../../lib/postInsightRow";
 
 // Per-post performance, built from the same platform metric APIs the insights
 // cron already uses — fetched by external_post_id, never scraped.
@@ -351,31 +353,8 @@ export class InsightsService {
       if (!target.social_accounts || String(target.external_post_id).includes("_mock_")) continue;
       try {
         const m = await this.fetchMetrics(target.platform, target.social_accounts, target.external_post_id);
-        const engagement = (m.likes || 0) + (m.comments || 0) + (m.shares || 0);
-        const engagementRate = m.reach ? +((engagement / m.reach) * 100).toFixed(2) : null;
         await supabase.from("post_insights").delete().eq("post_target_id", target.id);
-        await supabase.from("post_insights").insert({
-          post_target_id: target.id,
-          external_post_id: target.external_post_id,
-          platform: target.platform,
-          likes: m.likes ?? null,
-          comments: m.comments ?? null,
-          shares: m.shares ?? null,
-          impressions: m.impressions ?? null,
-          reach: m.reach ?? null,
-          viewers: m.viewers ?? null,
-          clicks: m.clicks ?? null,
-          saves: m.saves ?? null,
-          total_interactions: m.total_interactions ?? null,
-          three_second_views: m.three_second_views ?? null,
-          video_watch_time: m.video_watch_time ?? null,
-          video_avg_time: m.video_avg_time ?? null,
-          follows: m.follows ?? null,
-          replies: m.replies ?? null,
-          engagement_rate: engagementRate,
-          fetched_at: new Date().toISOString(),
-          raw: m.raw || {},
-        });
+        await supabase.from("post_insights").insert(buildPostInsightRow(target, m));
         synced++;
       } catch (err) {
         failed++;
