@@ -9,6 +9,7 @@ import {
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { StorageService } from "../../storage/storage.service";
 import { CANVA_API, canvaConfigured, getCanvaAccessToken } from "../../lib/canva";
+import { optimizeImageBuffer } from "../../lib/imageOptimize";
 
 @Injectable()
 export class CanvaService {
@@ -89,10 +90,26 @@ export class CanvaService {
     // Persist to our storage: Canva export URLs expire quickly.
     const fileRes = await fetch(job.urls[0]);
     if (!fileRes.ok) throw new HttpException("Couldn't download the exported design.", HttpStatus.BAD_GATEWAY);
-    const buf = Buffer.from(await fileRes.arrayBuffer());
+    let buf = Buffer.from(await fileRes.arrayBuffer());
 
-    const key = `${OWNER_ID}/canva-${designId}-${Date.now()}.png`;
-    const { url } = await this.storage.put(key, buf, "image/png");
+    // Canva exports can be huge — downscale/re-encode oversized ones so they
+    // don't fail at Facebook with an opaque "Invalid parameter" (see
+    // lib/imageOptimize). Best-effort: keep the original PNG on any failure.
+    let contentType = "image/png";
+    let ext = "png";
+    try {
+      const opt = await optimizeImageBuffer(buf, "image/png");
+      if (opt.changed) {
+        buf = opt.buffer;
+        contentType = opt.contentType;
+        if (opt.ext) ext = opt.ext;
+      }
+    } catch (e: any) {
+      console.warn("[canva] image optimize skipped:", e?.message);
+    }
+
+    const key = `${OWNER_ID}/canva-${designId}-${Date.now()}.${ext}`;
+    const { url } = await this.storage.put(key, buf, contentType);
     return { url };
   }
 }

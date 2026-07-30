@@ -20,6 +20,22 @@ function appendLink(text, link) {
   return text ? `${text}\n\n${link}` : link;
 }
 
+// Meta collapses many distinct failures into the generic "Invalid parameter"
+// (code 100) — useless on its own. The actionable reason lives in
+// error_user_title / error_user_msg / error_subcode (e.g. subcode 1366046 +
+// "Bad Image" when a photo/video URL can't be fetched). Surface those so a
+// failed post says WHY, not just "Invalid parameter". Falls back to
+// error.message, then the caller's default.
+function fbErrorMessage(data, fallback) {
+  const e = data?.error;
+  if (!e) return fallback;
+  const human = [e.error_user_title, e.error_user_msg].filter(Boolean).join(" — ");
+  const base = human || e.message || fallback;
+  const code = e.code != null ? `#${e.code}${e.error_subcode ? `/${e.error_subcode}` : ""}` : "";
+  const withCode = code && !base.includes(`#${e.code}`) ? `${base} (${code})` : base;
+  return e.fbtrace_id ? `${withCode} [trace ${e.fbtrace_id}]` : withCode;
+}
+
 // Normalize a post's media into the ordered [{url, type}] array. Older rows
 // (and CSV imports) only carry image_url — treat that as a one-image array.
 function postMedia(post) {
@@ -37,7 +53,7 @@ async function uploadUnpublishedPhoto(pageId, accessToken, imageUrl) {
     body: JSON.stringify({ url: imageUrl, published: false, access_token: accessToken })
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(data?.error?.message || "Photo upload failed.");
+  if (!res.ok) throw new Error(fbErrorMessage(data, "Photo upload failed."));
   return data.id;
 }
 
@@ -208,7 +224,7 @@ export async function publishUnpublishedFacebookPost({ account, externalPostId }
     body: JSON.stringify({ is_published: true, access_token: account.access_token })
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(data?.error?.message || "Failed to publish the unpublished post.");
+  if (!res.ok) throw new Error(fbErrorMessage(data, "Failed to publish the unpublished post."));
   return { ok: true };
 }
 
@@ -228,7 +244,7 @@ export async function updateScheduledFacebookPost({ account, externalPostId, mes
     body: JSON.stringify(payload)
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(data?.error?.message || "Failed to update scheduled Facebook post.");
+  if (!res.ok) throw new Error(fbErrorMessage(data, "Failed to update scheduled Facebook post."));
   return { ok: true };
 }
 
@@ -246,7 +262,7 @@ export async function postFacebookComment({ account, postId, message }) {
     body: JSON.stringify({ message: message.trim(), access_token: account.access_token })
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(data?.error?.message || "Failed to post first comment.");
+  if (!res.ok) throw new Error(fbErrorMessage(data, "Failed to post first comment."));
   return { commentId: data.id };
 }
 
@@ -376,7 +392,7 @@ export async function checkFacebookPostStatus({ account, externalPostId }) {
 async function parseFbResponse(res) {
   const data = await res.json();
   if (!res.ok) {
-    throw new Error(data?.error?.message || "Facebook API request failed.");
+    throw new Error(fbErrorMessage(data, "Facebook API request failed."));
   }
   return { externalPostId: data.post_id || data.id };
 }
@@ -398,7 +414,7 @@ async function ruploadHostedFile(kind, videoId, accessToken, fileUrl) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data?.success === false) {
-    throw new Error(data?.debug_info?.message || data?.error?.message || "Video upload to Facebook failed.");
+    throw new Error(data?.debug_info?.message || fbErrorMessage(data, "Video upload to Facebook failed."));
   }
 }
 
@@ -439,7 +455,7 @@ export async function publishFacebookReel({ account, post }) {
   });
   const start = await startRes.json();
   if (!startRes.ok || !start.video_id) {
-    throw new Error(start?.error?.message || "Couldn't start the Reel upload.");
+    throw new Error(fbErrorMessage(start, "Couldn't start the Reel upload."));
   }
 
   // 2. Hand Facebook the hosted file URL.
@@ -459,7 +475,7 @@ export async function publishFacebookReel({ account, post }) {
   });
   const finish = await finishRes.json();
   if (!finishRes.ok || finish?.success === false) {
-    throw new Error(finish?.error?.message || "Couldn't publish the Reel.");
+    throw new Error(fbErrorMessage(finish, "Couldn't publish the Reel."));
   }
 
   // 4. Wait for processing so the verify cron doesn't race an "uploading" reel.
@@ -494,7 +510,7 @@ export async function publishFacebookStory({ account, post }) {
     });
     const data = await res.json();
     if (!res.ok || data?.success === false) {
-      throw new Error(data?.error?.message || "Couldn't publish the photo Story.");
+      throw new Error(fbErrorMessage(data, "Couldn't publish the photo Story."));
     }
     return { externalPostId: data.post_id || photoId };
   }
@@ -507,7 +523,7 @@ export async function publishFacebookStory({ account, post }) {
   });
   const start = await startRes.json();
   if (!startRes.ok || !start.video_id) {
-    throw new Error(start?.error?.message || "Couldn't start the video Story upload.");
+    throw new Error(fbErrorMessage(start, "Couldn't start the video Story upload."));
   }
 
   await ruploadHostedFile("video_stories", start.video_id, account.access_token, media.url);
@@ -519,7 +535,7 @@ export async function publishFacebookStory({ account, post }) {
   });
   const finish = await finishRes.json();
   if (!finishRes.ok || finish?.success === false) {
-    throw new Error(finish?.error?.message || "Couldn't publish the video Story.");
+    throw new Error(fbErrorMessage(finish, "Couldn't publish the video Story."));
   }
 
   return { externalPostId: finish.post_id || start.video_id };
