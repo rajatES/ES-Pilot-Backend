@@ -16,6 +16,8 @@ import { logActivity } from "../../lib/activity";
 import { postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
 // @ts-ignore - plain JS fact-check gate (env-gated, fail-open, no-op without a key).
 import { factCheckCaption, factCheckEnabled } from "../../lib/factcheck";
+// @ts-ignore - shared auto-approve deadline helper (also used by posts.create).
+import { computeAutoApproveAt } from "../../lib/approvalSettings";
 
 const INSTANT_WINDOW_MS = 10 * 60 * 1000;
 
@@ -35,12 +37,80 @@ export class ApprovalsService {
     return { approvals: data };
   }
 
-  // action: submit | approve | reject
+  // Pending-approval queue as a flat list of (post × page) items — the UI groups
+  // them by page. Each item carries whether the current viewer may review it
+  // (admin, or the Group Head of the post author's division), so the client can
+  // show/hide actions without duplicating the rule.
+  async pending(me: any) {
+    const supabase = this.supabaseService.createServiceClient();
+    const { data: posts } = await supabase
+      .from("scheduled_posts")
+      .select("*, post_targets(*, social_accounts(id, display_name, platform, avatar_url, category, external_account_id))")
+      .eq("user_id", OWNER_ID)
+      .eq("status", "pending_review")
+      .order("created_at", { ascending: true });
+
+    const authorIds = [...new Set((posts || []).map((p: any) => p.created_by).filter(Boolean))];
+    const authorsById: Record<string, any> = {};
+    if (authorIds.length) {
+      const { data: profs } = await supabase.from("profiles").select("id, display_name, division_id").in("id", authorIds);
+      for (const a of profs || []) authorsById[a.id] = a;
+    }
+
+    const mediaType = (p: any) => {
+      const media = Array.isArray(p.media) ? p.media : [];
+      if (media.some((m: any) => m?.type === "video")) return "video";
+      if (media.some((m: any) => m?.type === "image") || p.image_url) return "photo";
+      if (p.link_url) return "link";
+      return "text";
+    };
+
+    const items: any[] = [];
+    for (const p of posts || []) {
+      const author = authorsById[p.created_by] || null;
+      const canReview =
+        me?.role === "admin" ||
+        (me?.is_group_head && author?.division_id && author.division_id === me?.division_id);
+      for (const t of p.post_targets || []) {
+        if (t.status !== "pending_review") continue; // only pages still awaiting review
+        const acct = t.social_accounts || {};
+        items.push({
+          postId: p.id,
+          targetId: t.id,
+          accountId: t.social_account_id,
+          externalAccountId: acct.external_account_id || null,
+          platform: t.platform,
+          page: acct.display_name || "Page",
+          avatarUrl: acct.avatar_url || null,
+          category: acct.category || null,
+          title: p.body || "",
+          thumbnailUrl: p.image_url || null,
+          linkUrl: p.link_url || null,
+          mediaType: mediaType(p),
+          format: p.platform_options?.[t.platform]?.format || null,
+          scheduledFor: p.scheduled_for,
+          autoApproveAt: p.auto_approve_at,
+          createdBy: p.created_by,
+          authorName: author?.display_name || null,
+          source: p.source || "app",
+          apiKeyId: p.api_key_id || null,
+          factCheck: p.fact_check || null,
+          submittedAt: p.created_at,
+          canReview: !!canReview,
+        });
+      }
+    }
+    return { items };
+  }
+
+  // action: submit | approve | reject.
+  // For approve/reject, an optional `accountId` scopes the action to a SINGLE
+  // page (post_target); omit it to act on every still-pending page of the post.
   async act(me: any, payload: any) {
     const supabase = this.supabaseService.createServiceClient();
     if (!me) throw new UnauthorizedException("Not logged in.");
 
-    const { postId, action, comment, override } = payload || {};
+    const { postId, accountId, action, comment, override } = payload || {};
     const reviewer = me.display_name || "You";
     if (!postId || !action) throw new BadRequestException("postId and action required.");
 
@@ -50,6 +120,7 @@ export class ApprovalsService {
 
     // Approving/rejecting is restricted: admins act on anything; a Group Head
     // only on posts from their OWN division. Submitting has no restriction.
+    // (Page grouping is a navigation aid — permission stays author-division-based.)
     if (action !== "submit" && me.role !== "admin") {
       if (!me.is_group_head) {
         throw new ForbiddenException("Only an admin or your division's Group Head can approve/reject posts.");
@@ -73,34 +144,35 @@ export class ApprovalsService {
       post_id: postId,
       action,
       reviewer: reviewer || "You",
+      approver_id: me.id || null,
+      social_account_id: accountId || null,
       comment: comment || null,
     });
 
-    if (action !== "approve") {
-      const next: any =
-        action === "submit"
-          ? { approval_status: "pending", status: "pending_review", auto_approve_at: await this.autoApproveAt(supabase) }
-          : { approval_status: "rejected", status: "rejected", auto_approve_at: null };
-
+    // ── submit / resubmit ── (whole post; resets reviewable pages to pending)
+    if (action === "submit") {
+      const { data: existing } = await supabase.from("post_targets").select("id, status").eq("post_id", postId);
+      for (const t of existing || []) {
+        if (t.status !== "sent" && t.status !== "scheduled" && t.status !== "publishing") {
+          await supabase
+            .from("post_targets")
+            .update({ status: "pending_review", reviewed_by: null, reviewed_at: null })
+            .eq("id", t.id);
+        }
+      }
       const { data: post, error } = await supabase
         .from("scheduled_posts")
-        .update(next)
+        .update({ approval_status: "pending", status: "pending_review", auto_approve_at: await computeAutoApproveAt(supabase, OWNER_ID) })
         .eq("id", postId)
         .eq("user_id", OWNER_ID)
         .select(POST_WITH_TARGETS)
         .single();
       if (error) throw new InternalServerErrorException(error.message);
-
-      await logActivity({
-        type: `approval.${action}`,
-        title: `Post ${action} by ${reviewer || "You"}`,
-        status: action === "reject" ? "warning" : "info",
-        meta: { postId },
-      });
+      await logActivity({ type: "approval.submit", title: `Post submitted for review by ${reviewer}`, status: "info", meta: { postId } });
       return { post };
     }
 
-    // ── approve ──
+    // ── approve / reject ── load post + its targets
     const { data: post, error: fetchError } = await supabase
       .from("scheduled_posts")
       .select("*, post_targets(*, social_accounts(*))")
@@ -109,8 +181,35 @@ export class ApprovalsService {
       .single();
     if (fetchError || !post) throw new NotFoundException(fetchError?.message || "Post not found.");
 
-    // Fact-check gate (skipped on explicit override). On block/flag the post is
-    // held in pending_review with the verdict attached so the reviewer can then
+    // Which pages this action applies to: the single requested page, or all
+    // still-pending pages when no accountId is given.
+    let targets = (post.post_targets || []).filter((t: any) => t.status === "pending_review");
+    if (accountId) targets = targets.filter((t: any) => t.social_account_id === accountId);
+    if (!targets.length) {
+      const { data: fresh } = await supabase.from("scheduled_posts").select(POST_WITH_TARGETS).eq("id", postId).single();
+      return { post: fresh, warning: "No pending pages for this action." };
+    }
+
+    if (action === "reject") {
+      const now = new Date().toISOString();
+      for (const t of targets) {
+        await supabase
+          .from("post_targets")
+          .update({ status: "rejected", reviewed_by: me.id || null, reviewed_at: now })
+          .eq("id", t.id);
+      }
+      const updated = await this.recomputePostStatus(supabase, postId);
+      await logActivity({
+        type: "approval.reject",
+        title: `Rejected ${targets.length} page(s) by ${reviewer}`,
+        status: "warning",
+        meta: { postId, accountId: accountId || null },
+      });
+      return { post: updated };
+    }
+
+    // ── approve ── Fact-check gate (post-level; the caption is shared). On
+    // block/flag the post is held with the verdict attached so the reviewer can
     // "Approve anyway" (override:true).
     let applied = post.fact_check || null;
     if (!override && factCheckEnabled()) {
@@ -137,19 +236,23 @@ export class ApprovalsService {
       applied = { ...post.fact_check, overridden: true, overridden_by: reviewer, at: new Date().toISOString() };
     }
 
-    return this.publishApprovedPost(supabase, post, reviewer, applied);
+    return this.publishTargets(supabase, post, targets, reviewer, applied, me.id || null);
   }
 
-  // Publishes/schedules every target of an approved post, then finalizes the
-  // post row. Shared by manual approve and the auto-approve cron.
-  private async publishApprovedPost(supabase: any, post: any, reviewer: string, factCheck: any) {
+  // Publishes/schedules a GIVEN set of the post's targets (one page for a
+  // per-page approval, or all pending pages for a whole-post/auto approve),
+  // stamps each with the approver, then rolls the post status up from ALL its
+  // targets. Shared by manual approve and the auto-approve cron.
+  private async publishTargets(supabase: any, post: any, targets: any[], reviewer: string, factCheck: any, approverId: string | null) {
     const diffMs = new Date(post.scheduled_for).getTime() - Date.now();
     const publishNow = diffMs <= INSTANT_WINDOW_MS;
     const results: any[] = [];
+    const review = () => ({ reviewed_by: approverId, reviewed_at: new Date().toISOString() });
 
-    for (const target of post.post_targets || []) {
+    for (const target of targets || []) {
       const account: any = target.social_accounts;
       if (!account) {
+        await supabase.from("post_targets").update({ status: "failed", last_error: "Page no longer connected.", ...review() }).eq("id", target.id);
         results.push({ status: "failed", error: "Page no longer connected." });
         continue;
       }
@@ -167,7 +270,7 @@ export class ApprovalsService {
         // native scheduler never lets us attach a first comment afterwards, so we
         // schedule FB ourselves too — like IG/Threads/X and FB Reels/Stories.
         if (account.platform !== "youtube" && !publishNow) {
-          await supabase.from("post_targets").update({ status: "scheduled" }).eq("id", target.id);
+          await supabase.from("post_targets").update({ status: "scheduled", ...review() }).eq("id", target.id);
           results.push({ accountId: account.id, name: account.display_name, status: "scheduled" });
           continue;
         }
@@ -205,7 +308,7 @@ export class ApprovalsService {
 
         await supabase
           .from("post_targets")
-          .update({ status: targetStatus, external_post_id: result.externalPostId, sent_at: sentAt })
+          .update({ status: targetStatus, external_post_id: result.externalPostId, sent_at: sentAt, ...review() })
           .eq("id", target.id);
 
         // Stories have no comments — skip the first comment for them.
@@ -228,36 +331,24 @@ export class ApprovalsService {
 
         results.push({ accountId: account.id, name: account.display_name, status: targetStatus });
       } catch (err) {
-        await supabase.from("post_targets").update({ status: "failed", last_error: err.message }).eq("id", target.id);
+        await supabase.from("post_targets").update({ status: "failed", last_error: err.message, ...review() }).eq("id", target.id);
         results.push({ accountId: account.id, name: account.display_name, status: "failed", error: err.message });
       }
     }
 
-    const allFailed = results.length > 0 && results.every((r) => r.status === "failed");
+    // Attach the fact-check verdict, then roll the post status up from ALL its
+    // targets (this batch may be just one page of several).
+    await supabase.from("scheduled_posts").update({ fact_check: factCheck }).eq("id", post.id).eq("user_id", OWNER_ID);
+    const updated = await this.recomputePostStatus(supabase, post.id);
+
     const anyFailed = results.some((r) => r.status === "failed");
-    const allSent = publishNow && results.every((r) => r.status === "sent");
-    const finalStatus = allFailed ? "failed" : publishNow ? "sent" : "scheduled";
-
-    const { data: updated, error: updateError } = await supabase
-      .from("scheduled_posts")
-      .update({
-        status: finalStatus,
-        approval_status: "approved",
-        auto_approve_at: null,
-        fact_check: factCheck,
-        sent_at: allSent ? new Date().toISOString() : null,
-      })
-      .eq("id", post.id)
-      .eq("user_id", OWNER_ID)
-      .select(POST_WITH_TARGETS)
-      .single();
-    if (updateError) throw new InternalServerErrorException(updateError.message);
-
+    const allFailed = results.length > 0 && results.every((r) => r.status === "failed");
+    const okCount = results.filter((r) => r.status !== "failed").length;
     await logActivity({
       type: allFailed ? "post.failed" : "approval.approve",
       title: allFailed
-        ? "Approved post failed on all pages"
-        : `Approved and published to ${results.filter((r) => r.status !== "failed").length} page(s) by ${reviewer}`,
+        ? "Approved page(s) failed to publish"
+        : `Approved ${okCount} page(s) by ${reviewer}`,
       status: allFailed ? "error" : anyFailed ? "warning" : "success",
       meta: { postId: post.id, results: results.map((r) => ({ name: r.name, status: r.status })) },
     });
@@ -265,19 +356,41 @@ export class ApprovalsService {
     return { post: updated, warning: anyFailed && !allFailed ? "Some pages failed." : null };
   }
 
-  // Resolves the auto-approve deadline for a freshly-submitted post from the
-  // shared app setting, or null when auto-approve is off.
-  private async autoApproveAt(supabase: any): Promise<string | null> {
-    const { data } = await supabase
-      .from("app_settings")
-      .select("value")
+  // Rolls a post's status/approval_status up from its per-page targets:
+  //  - any page still pending_review  → post stays pending_review
+  //  - otherwise → approved if any page was published/scheduled (even if some
+  //    failed), else rejected (all pages rejected). status mirrors the pages.
+  private async recomputePostStatus(supabase: any, postId: string) {
+    const { data: targets } = await supabase.from("post_targets").select("status").eq("post_id", postId);
+    const list = targets || [];
+    const pending = list.filter((t: any) => t.status === "pending_review");
+    let update: any;
+    if (pending.length) {
+      update = { approval_status: "pending", status: "pending_review" };
+    } else {
+      const attempted = list.filter((t: any) => ["sent", "scheduled", "publishing", "failed"].includes(t.status));
+      const published = list.filter((t: any) => ["sent", "scheduled", "publishing"].includes(t.status));
+      let status: string;
+      if (!attempted.length) status = "rejected"; // every page rejected
+      else if (!published.length) status = "failed"; // all attempts failed
+      else if (list.some((t: any) => t.status === "sent")) status = "sent";
+      else status = "scheduled";
+      update = {
+        approval_status: attempted.length ? "approved" : "rejected",
+        status,
+        auto_approve_at: null,
+        sent_at: status === "sent" ? new Date().toISOString() : null,
+      };
+    }
+    const { data: post, error } = await supabase
+      .from("scheduled_posts")
+      .update(update)
+      .eq("id", postId)
       .eq("user_id", OWNER_ID)
-      .eq("key", "app")
-      .maybeSingle();
-    const cfg = data?.value || {};
-    if (!cfg.autoApprove) return null;
-    const hours = Number(cfg.autoApproveHours) > 0 ? Number(cfg.autoApproveHours) : 24;
-    return new Date(Date.now() + hours * 3600000).toISOString();
+      .select(POST_WITH_TARGETS)
+      .single();
+    if (error) throw new InternalServerErrorException(error.message);
+    return post;
   }
 
   // Cron entry point: approve every pending_review post whose auto_approve_at
@@ -317,7 +430,8 @@ export class ApprovalsService {
           }
           applied = fc;
         }
-        await this.publishApprovedPost(supabase, post, "Auto-approve", applied);
+        const pending = (post.post_targets || []).filter((t: any) => t.status === "pending_review");
+        await this.publishTargets(supabase, post, pending, "Auto-approve", applied, null);
         approved++;
       } catch (e) {
         failed++;

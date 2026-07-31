@@ -51,11 +51,15 @@ export class CronService {
     this.authorize(req);
     const supabase = this.supabaseService.createServiceClient();
 
+    // Include pending_review too: with per-page approval, a post can have one
+    // page approved (target "scheduled") while another page still awaits review
+    // (post stays "pending_review"). The approved page must still publish at its
+    // time — we key off the TARGET status below, not the post status.
     const { data: due, error } = await supabase
       .from("scheduled_posts")
       .select("*, post_targets(*, social_accounts(*))")
       .eq("user_id", OWNER_ID)
-      .eq("status", "scheduled")
+      .in("status", ["scheduled", "pending_review"])
       .lte("scheduled_for", new Date().toISOString())
       .order("scheduled_for", { ascending: true })
       .limit(25);
@@ -142,11 +146,15 @@ export class CronService {
 
       const { data: fresh } = await supabase.from("post_targets").select("status").eq("post_id", post.id);
       const statuses = (fresh || []).map((t) => t.status);
-      const newStatus = statuses.some((s) => s === "sent" || s === "scheduled")
-        ? statuses.includes("scheduled")
-          ? "scheduled"
-          : "sent"
-        : "failed";
+      // Keep the post in review while any page still awaits approval — only the
+      // approved pages just published above; the rest stay pending.
+      const newStatus = statuses.includes("pending_review")
+        ? "pending_review"
+        : statuses.some((s) => s === "sent" || s === "scheduled")
+          ? statuses.includes("scheduled")
+            ? "scheduled"
+            : "sent"
+          : "failed";
       await supabase
         .from("scheduled_posts")
         .update({ status: newStatus, sent_at: newStatus === "sent" ? new Date().toISOString() : null })

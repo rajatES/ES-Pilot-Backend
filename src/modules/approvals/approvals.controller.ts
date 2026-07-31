@@ -11,6 +11,12 @@ export class ApprovalsController {
     return this.approvals.list(postId);
   }
 
+  // Page-grouped pending-approval queue (one item per post × page).
+  @Get("pending")
+  pending(@CurrentProfile() me: any) {
+    return this.approvals.pending(me);
+  }
+
   @Post()
   act(@CurrentProfile() me: any, @Body() body: any) {
     return this.approvals.act(me, body);

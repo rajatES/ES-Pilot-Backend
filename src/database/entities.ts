@@ -343,6 +343,15 @@ export class PostTarget {
   @Column({ name: "sent_at", type: "timestamptz", nullable: true })
   sent_at: Date | null;
 
+  // Per-page approval audit: who approved/rejected THIS page's copy, and when.
+  // Enables independent per-page review (a post can be approved for one page
+  // while another still waits).
+  @Column({ name: "reviewed_by", type: "uuid", nullable: true })
+  reviewed_by: string | null;
+
+  @Column({ name: "reviewed_at", type: "timestamptz", nullable: true })
+  reviewed_at: Date | null;
+
   @Column({ name: "last_verified_at", type: "timestamptz", nullable: true })
   last_verified_at: Date | null;
 
@@ -609,6 +618,12 @@ export class Approval {
 
   @Column({ type: "text", nullable: true }) reviewer: string | null;
   @Column({ type: "text", nullable: true }) comment: string | null;
+
+  // First-class audit: the profile that acted (WHO), and the specific page this
+  // action was for on a per-page approval (null = whole-post action). `reviewer`
+  // is kept as the display-name for easy rendering.
+  @Column({ name: "approver_id", type: "uuid", nullable: true }) approver_id: string | null;
+  @Column({ name: "social_account_id", type: "uuid", nullable: true }) social_account_id: string | null;
 
   @CreateDateColumn({ name: "created_at", type: "timestamptz" })
   created_at: Date;

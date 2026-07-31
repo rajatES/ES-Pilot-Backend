@@ -31,6 +31,8 @@ import {
   sanitizePlatformCaptions,
   sanitizePlatformOptions,
 } from "../../lib/postContent";
+// @ts-ignore - shared auto-approve deadline helper.
+import { computeAutoApproveAt } from "../../lib/approvalSettings";
 
 // Facebook's native scheduler only accepts times 10 min – 30 days out.
 // Anything sooner than 10 min (or in the past) we just publish immediately.
@@ -139,6 +141,10 @@ export class PostsService {
           scheduled_for: scheduledFor ? new Date(scheduledFor).toISOString() : new Date().toISOString(),
           status,
           approval_status: saveAs === "review" ? "pending" : "none",
+          // Review posts inherit the shared auto-approve grace window (null when
+          // auto-approve is off) — so API/composer submissions behave the same
+          // as the in-app "Submit for review".
+          auto_approve_at: saveAs === "review" ? await computeAutoApproveAt(supabase, OWNER_ID) : null,
           content_type: contentType || null,
           template_id: templateId || null,
           first_comment: firstComment || null,
