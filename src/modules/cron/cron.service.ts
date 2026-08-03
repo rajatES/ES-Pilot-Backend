@@ -210,7 +210,15 @@ export class CronService {
         }
         // Reels/Stories are exempt from existence checks: stories expire after
         // 24h (a 404 is NOT a deletion) and reel ids need a different lookup.
-        if (account.platform === "facebook" && fbFormat(post) !== "post") {
+        // Detect them by the declared format OR by the id shape — feed posts are
+        // "{pageId}_{postId}", while reels/videos/stories carry a bare numeric
+        // id. Querying is_published/message on a bare id returns code 10/100,
+        // which the existence check mistakes for a deletion, so a live reel gets
+        // wrongly marked "deleted on platform".
+        if (
+          account.platform === "facebook" &&
+          (fbFormat(post) !== "post" || !String(target.external_post_id).includes("_"))
+        ) {
           targetStatuses.push(target.status);
           continue;
         }
