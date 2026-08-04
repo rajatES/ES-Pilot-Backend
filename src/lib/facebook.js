@@ -389,11 +389,18 @@ async function parseFbResponse(res) {
 // problems), so scheduled reels/stories go through the cron queue like IG.
 
 const RUPLOAD = "https://rupload.facebook.com";
+// rupload uses a single "video-upload/<version>" path for both reels and
+// stories — NOT /video_reels or /video_stories (those 404 as "Endpoint doesn't
+// exist"). Derive the version from GRAPH so it stays in lockstep.
+const GRAPH_VERSION = GRAPH.split("/").pop();
+const ruploadUrl = (videoId) => `${RUPLOAD}/video-upload/${GRAPH_VERSION}/${videoId}`;
 
 // Upload a hosted video to an upload session. rupload uses HEADERS (not a
 // JSON body) and the "OAuth" auth scheme — unlike everything else here.
-async function ruploadHostedFile(kind, videoId, accessToken, fileUrl) {
-  const res = await fetch(`${RUPLOAD}/${kind}/${videoId}`, {
+// Prefer the upload_url Facebook returns from the start phase; fall back to
+// the constructed video-upload URL if it's missing.
+async function ruploadHostedFile(uploadUrl, accessToken, fileUrl) {
+  const res = await fetch(uploadUrl, {
     method: "POST",
     headers: { Authorization: `OAuth ${accessToken}`, file_url: fileUrl },
   });
@@ -444,7 +451,7 @@ export async function publishFacebookReel({ account, post }) {
   }
 
   // 2. Hand Facebook the hosted file URL.
-  await ruploadHostedFile("video_reels", start.video_id, account.access_token, video.url);
+  await ruploadHostedFile(start.upload_url || ruploadUrl(start.video_id), account.access_token, video.url);
 
   // 3. Finish + publish with the caption.
   const finishRes = await fetch(`${GRAPH}/${pageId}/video_reels`, {
@@ -511,7 +518,7 @@ export async function publishFacebookStory({ account, post }) {
     throw new Error(fbErrorMessage(start, "Couldn't start the video Story upload."));
   }
 
-  await ruploadHostedFile("video_stories", start.video_id, account.access_token, media.url);
+  await ruploadHostedFile(start.upload_url || ruploadUrl(start.video_id), account.access_token, media.url);
 
   const finishRes = await fetch(`${GRAPH}/${pageId}/video_stories`, {
     method: "POST",
