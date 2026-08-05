@@ -20,7 +20,7 @@ import {
 import { publishInstagramPost, postInstagramComment, checkInstagramPostStatus } from "../../lib/instagram";
 import { publishThreadsPost, postThreadsReply, checkThreadsPostStatus } from "../../lib/threads";
 import { publishXPost, postXReply, checkXPostStatus } from "../../lib/x";
-import { publishYouTubeVideo, checkYouTubeVideoStatus } from "../../lib/youtube";
+import { publishYouTubeVideo, checkYouTubeVideoStatus, updateScheduledYouTubeVideo } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
 import { runCompliance } from "../../lib/compliance";
@@ -447,6 +447,18 @@ export class PostsService {
           warnings.push(`${target.social_accounts?.display_name || "Page"}: ${e.message}`);
         }
       }
+      // YouTube schedules natively on the video, so push the new time to it too.
+      if (scheduledFor && target.status === "scheduled" && target.platform === "youtube" && target.external_post_id) {
+        try {
+          await updateScheduledYouTubeVideo({
+            account: target.social_accounts,
+            videoId: target.external_post_id,
+            scheduledFor,
+          });
+        } catch (e) {
+          warnings.push(`${target.social_accounts?.display_name || "Channel"}: ${e.message}`);
+        }
+      }
     }
 
     const update: any = {};
@@ -543,6 +555,18 @@ export class PostsService {
               } as any);
             } catch (e) {
               console.warn(`[posts/bulk] reschedule push failed for ${post.id}:`, e.message);
+            }
+          }
+          // YouTube schedules natively on the video, so push the new time to it too.
+          if (target.status === "scheduled" && target.platform === "youtube" && target.external_post_id) {
+            try {
+              await updateScheduledYouTubeVideo({
+                account: target.social_accounts,
+                videoId: target.external_post_id,
+                scheduledFor: newDate,
+              } as any);
+            } catch (e) {
+              console.warn(`[posts/bulk] YouTube reschedule push failed for ${post.id}:`, e.message);
             }
           }
         }

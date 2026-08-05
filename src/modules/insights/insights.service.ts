@@ -28,7 +28,7 @@ export class InsightsService {
     const { data: posts, error } = await supabase
       .from("scheduled_posts")
       .select(
-        "id, body, image_url, link_url, content_type, sent_at, status, post_targets(id, platform, status, external_post_id, social_accounts(display_name, platform, category))",
+        "id, body, image_url, link_url, media, content_type, sent_at, status, post_targets(id, platform, status, external_post_id, social_accounts(display_name, platform, category))",
       )
       .eq("user_id", OWNER_ID)
       .eq("status", "sent")
@@ -74,7 +74,9 @@ export class InsightsService {
         return {
           targetId: t.id,
           platform: t.platform,
-          page: acct.display_name || "Unknown",
+          // null when the account was disconnected — filtered out of `pages`
+          // below so dangling targets don't show up as "Unknown".
+          page: acct.display_name || null,
           externalPostId: t.external_post_id,
           likes: ins?.likes ?? null,
           comments: ins?.comments ?? null,
@@ -93,7 +95,8 @@ export class InsightsService {
         content_type: p.content_type,
         sent_at: p.sent_at,
         category: targets[0]?.social_accounts?.category || "Other",
-        pages: perTarget.map((t: any) => t.page),
+        postType: this.derivePostType(p),
+        pages: perTarget.map((t: any) => t.page).filter(Boolean),
         platforms: [...new Set(perTarget.map((t: any) => t.platform))],
         likes,
         comments,
@@ -305,7 +308,7 @@ export class InsightsService {
   private derivePostType(p: any): "video" | "photo" | "link" | "text" {
     const media = Array.isArray(p.media) ? p.media : [];
     if (media.some((m: any) => m?.type === "video")) return "video";
-    if (media.some((m: any) => m?.type === "image")) return "photo";
+    if (media.some((m: any) => m?.type === "image") || p.image_url) return "photo";
     if (p.link_url) return "link";
     return "text";
   }

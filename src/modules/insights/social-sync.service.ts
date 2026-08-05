@@ -1,5 +1,6 @@
 import { ForbiddenException, Injectable } from "@nestjs/common";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
+import { StorageService } from "../../storage/storage.service";
 // @ts-ignore - plain JS platform clients.
 import { listFacebookPagePosts, getFacebookPostMetrics } from "../../lib/facebook";
 // @ts-ignore
@@ -13,7 +14,39 @@ const MAX_PER_ACCOUNT = 200;
 
 @Injectable()
 export class SocialSyncService {
-  constructor(private readonly supabaseService: SupabaseService) {}
+  constructor(
+    private readonly supabaseService: SupabaseService,
+    private readonly storage: StorageService,
+  ) {}
+
+  // Already a copy on our own S3 — skip re-downloading.
+  private isOurStorage(url: string | null): boolean {
+    if (!url) return false;
+    try {
+      return url.startsWith(this.storage.publicUrl(""));
+    } catch {
+      return false;
+    }
+  }
+
+  // FB/IG thumbnail URLs are signed CDN links that expire after a day or two.
+  // Copy the image to our S3 so it stays valid. On failure keep the CDN URL.
+  private async mirrorThumbnail(cdnUrl: string | null, keyBase: string): Promise<string | null> {
+    if (!cdnUrl) return null;
+    try {
+      const res = await fetch(cdnUrl);
+      if (!res.ok) return cdnUrl;
+      const buf = Buffer.from(await res.arrayBuffer());
+      const ct = res.headers.get("content-type") || "image/jpeg";
+      const ext = /png/.test(ct) ? "png" : /webp/.test(ct) ? "webp" : /gif/.test(ct) ? "gif" : "jpg";
+      const key = `social-thumbs/${keyBase.replace(/[^a-zA-Z0-9_-]/g, "_")}.${ext}`;
+      const { url } = await this.storage.put(key, buf, ct);
+      return url;
+    } catch (e: any) {
+      console.warn("[social-sync] thumbnail mirror failed:", e.message);
+      return cdnUrl;
+    }
+  }
 
   // Window from days/start/end — same convention as InsightsService.refresh.
   private window(body: any) {
@@ -65,10 +98,10 @@ export class SocialSyncService {
       // Existing rows for this account → insert vs update by external_post_id.
       const { data: existingRows } = await db
         .from("social_posts")
-        .select("id, external_post_id")
+        .select("id, external_post_id, thumbnail_url")
         .eq("social_account_id", account.id);
-      const existingByExt: Record<string, string> = {};
-      for (const r of existingRows || []) existingByExt[r.external_post_id] = r.id;
+      const existingByExt: Record<string, any> = {};
+      for (const r of existingRows || []) existingByExt[r.external_post_id] = r;
 
       let posts: any[] = [];
       try {
@@ -143,8 +176,16 @@ export class SocialSyncService {
                   three_second_views: null,
                 };
 
-          const existingId = existingByExt[extId];
-          if (existingId) await db.from("social_posts").update(row).eq("id", existingId);
+          const existing = existingByExt[extId];
+
+          // Reuse an existing mirror, else copy the fresh CDN thumbnail to S3.
+          if (existing && this.isOurStorage(existing.thumbnail_url)) {
+            row.thumbnail_url = existing.thumbnail_url;
+          } else if (row.thumbnail_url) {
+            row.thumbnail_url = await this.mirrorThumbnail(row.thumbnail_url, `${account.platform}_${extId}`);
+          }
+
+          if (existing) await db.from("social_posts").update(row).eq("id", existing.id);
           else await db.from("social_posts").insert(row);
           synced++;
           acctSynced++;

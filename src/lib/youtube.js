@@ -177,6 +177,38 @@ export async function getYouTubeVideoStatus({ account, videoId }) {
   };
 }
 
+// Move a scheduled video's publishAt. Only works while it's still private.
+// videos.update replaces the whole status part, so re-send privacy/madeForKids.
+export async function updateScheduledYouTubeVideo({ account, videoId, scheduledFor }) {
+  if (!videoId || String(videoId).includes("_mock_")) return { ok: true };
+  if (isMockMode()) return { ok: true };
+  if (!scheduledFor) return { ok: true };
+
+  const current = await getYouTubeVideoStatus({ account, videoId });
+  if (current.exists === false) throw new Error("The scheduled YouTube video no longer exists.");
+  if (current.exists === null) throw new Error(current.error || "Couldn't read the YouTube video status.");
+  if (current.isPublished) throw new Error("This YouTube video is already public and can't be rescheduled.");
+
+  const accessToken = await getYouTubeAccessToken(account.refresh_token);
+  const body = {
+    id: videoId,
+    status: {
+      privacyStatus: "private",
+      selfDeclaredMadeForKids: false,
+      publishAt: new Date(scheduledFor).toISOString(),
+    },
+  };
+
+  const res = await fetch(`${YOUTUBE_API}/videos?part=status`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error?.message || "Failed to reschedule the YouTube video.");
+  return { ok: true };
+}
+
 // Check if video still exists (for deletion detection)
 export async function checkYouTubeVideoStatus({ account, videoId }) {
   if (videoId.includes("_mock_")) {
