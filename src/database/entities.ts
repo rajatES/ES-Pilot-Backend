@@ -800,8 +800,166 @@ export class ApiIdempotency {
   created_at: Date;
 }
 
+// ── Automation config (per connected account) ────────────────────────────
+// The editorial brief a content automation needs in order to write FOR a page:
+// which entities it covers, where it listens, how its captions sound, what its
+// cards look like, how much it may post. Pilot already owns page IDENTITY and
+// HEALTH; this is the layer that says what the page is ABOUT.
+//
+// Added 2026-08-06 to retire the ES Facebook automation's S3 page registry
+// (`config/page-registry/*.json`). That registry held exactly these fields plus
+// a Facebook page id it never actually populated — 0 of 22 rows had one — while
+// Pilot has had the real `external_account_id` all along. Folding the config in
+// here makes one record the whole truth about a page instead of two that have to
+// be joined on an id one side was missing.
+//
+// A SEPARATE TABLE rather than more `social_accounts.metadata` jsonb: that column
+// already carries `connected_via` and `auth_error`, both written by the publish
+// path on failure. Editorial config is edited by people on a completely different
+// cadence, and a jsonb merge racing an auth-error write is a real way to lose one
+// of them. Different writers, different lifetimes, different table.
+//
+// Every field is nullable/defaulted. A row that exists but is half-filled is the
+// normal state while a page is being set up, and the consumer's own defaults
+// (see `computeDailyBudget`) cover the gaps.
+@Entity("account_automation_config")
+@Unique(["social_account_id"])
+export class AccountAutomationConfig {
+  @PrimaryGeneratedColumn("uuid")
+  id: string;
+
+  @Index()
+  @Column({ name: "social_account_id", type: "uuid" })
+  social_account_id: string;
+
+  // Legacy correlation id (`p02`, `p14`…). NOT decorative: the automation's S3
+  // pool artefacts, ledger rows and dedup keys are all keyed on it, and the
+  // legacy Claude routine still writes the same keys while both run in parallel.
+  // Retire it only after cutover, when nothing reads those keys any more.
+  @Index()
+  @Column({ name: "es_page_id", type: "text", nullable: true })
+  es_page_id: string | null;
+
+  // Master switch. FALSE by default so that creating a row — or connecting a new
+  // page — can never by itself put a page into an automation's rotation. Opting
+  // in is always a deliberate edit.
+  @Column({ name: "automation_enabled", type: "boolean", default: false })
+  automation_enabled: boolean;
+
+  // `light` pins the page to its declared wave_slots, `semi` to a fixed daily
+  // count, `full` to a min/max band. See the consumer's computeDailyBudget.
+  @Column({ name: "automation_level", type: "text", default: "light" })
+  automation_level: string;
+
+  // ── What the page is about ─────────────────────────────────────────────
+  // sport_groups is an ARRAY and deliberately not social_accounts.category:
+  // category is a single string driving Pilot's own UI filters, while a page
+  // like "WNBA/NCAA" legitimately covers several. Two different questions.
+  @Column({ name: "sport_groups", type: "jsonb", default: () => "'[]'::jsonb" })
+  sport_groups: string[];
+
+  // [{ name, keywords[], weight }] — weight biases how often each gets a slot.
+  @Column({ type: "jsonb", default: () => "'[]'::jsonb" })
+  entities: Array<{ name: string; keywords?: string[]; weight?: number }>;
+
+  @Column({ name: "rival_entities", type: "jsonb", default: () => "'[]'::jsonb" })
+  rival_entities: string[];
+
+  @Column({ name: "page_theme", type: "text", nullable: true })
+  page_theme: string | null;
+
+  // Free text, read by the editorial prompt. E.g. a deceased figure who may only
+  // be covered in tribute framing.
+  @Column({ type: "text", nullable: true })
+  sensitivities: string | null;
+
+  @Column({ name: "national_threshold", type: "int", nullable: true })
+  national_threshold: number | null;
+
+  // ── Where it listens ───────────────────────────────────────────────────
+  @Column({ type: "jsonb", default: () => "'[]'::jsonb" })
+  subreddits: string[];
+
+  @Column({ name: "twitter_handles", type: "jsonb", default: () => "'[]'::jsonb" })
+  twitter_handles: string[];
+
+  @Column({ name: "external_feed_urls", type: "jsonb", default: () => "'[]'::jsonb" })
+  external_feed_urls: string[];
+
+  // ── How its captions sound ─────────────────────────────────────────────
+  @Column({ name: "caption_voice", type: "text", nullable: true })
+  caption_voice: string | null;
+
+  @Column({ name: "word_count_min", type: "int", nullable: true })
+  word_count_min: number | null;
+
+  @Column({ name: "word_count_max", type: "int", nullable: true })
+  word_count_max: number | null;
+
+  @Column({ name: "emoji_count_min", type: "int", nullable: true })
+  emoji_count_min: number | null;
+
+  @Column({ name: "emoji_count_max", type: "int", nullable: true })
+  emoji_count_max: number | null;
+
+  @Column({ name: "case_rule", type: "text", nullable: true })
+  case_rule: string | null;
+
+  @Column({ type: "boolean", nullable: true })
+  hashtags: boolean | null;
+
+  // Terms that take a candidate out of contention for THIS page specifically —
+  // distinct from the global blocked-terms list.
+  @Column({ name: "hard_skip_keywords", type: "jsonb", default: () => "'[]'::jsonb" })
+  hard_skip_keywords: string[];
+
+  @Column({ name: "british_english", type: "boolean", default: false })
+  british_english: boolean;
+
+  // ── What its cards look like ───────────────────────────────────────────
+  @Column({ name: "accent_hex", type: "text", nullable: true })
+  accent_hex: string | null;
+
+  @Column({ name: "accent2_hex", type: "text", nullable: true })
+  accent2_hex: string | null;
+
+  @Column({ name: "logo_mode", type: "text", nullable: true })
+  logo_mode: string | null;
+
+  // ── How much it may post ───────────────────────────────────────────────
+  // "HH:MM" strings, page-local posting waves.
+  @Column({ name: "wave_slots", type: "jsonb", default: () => "'[]'::jsonb" })
+  wave_slots: string[];
+
+  @Column({ name: "posting_window_start", type: "text", nullable: true })
+  posting_window_start: string | null;
+
+  @Column({ name: "posting_window_end", type: "text", nullable: true })
+  posting_window_end: string | null;
+
+  @Column({ name: "daily_budget_fixed", type: "int", nullable: true })
+  daily_budget_fixed: number | null;
+
+  @Column({ name: "daily_budget_min", type: "int", nullable: true })
+  daily_budget_min: number | null;
+
+  @Column({ name: "daily_budget_max", type: "int", nullable: true })
+  daily_budget_max: number | null;
+
+  // ── Tracking ───────────────────────────────────────────────────────────
+  @Column({ name: "utm_params", type: "jsonb", default: () => "'{}'::jsonb" })
+  utm_params: Record<string, string>;
+
+  @CreateDateColumn({ name: "created_at", type: "timestamptz" })
+  created_at: Date;
+
+  @UpdateDateColumn({ name: "updated_at", type: "timestamptz" })
+  updated_at: Date;
+}
+
 export const ALL_ENTITIES = [
   Profile,
+  AccountAutomationConfig,
   Division,
   Sport,
   DesignTemplate,

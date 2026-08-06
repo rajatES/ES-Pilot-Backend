@@ -7,6 +7,7 @@ import {
   HttpCode,
   Param,
   Post,
+  Put,
   Query,
   UploadedFile,
   UseGuards,
@@ -28,9 +29,31 @@ export class PublicApiController {
   constructor(private readonly api: PublicApiService) {}
 
   // GET /api/v1/accounts — connected pages/accounts and their IDs.
+  //
+  // `?include=automation` attaches each page's automation config;
+  // `?automationEnabled=true` returns only the pages opted in to automation —
+  // which is the list a content pipeline should actually iterate, so that
+  // "which pages do I run for?" is answered by the server rather than by a
+  // client-side filter somebody can forget.
   @Get("accounts")
-  listAccounts() {
-    return this.api.listAccounts();
+  listAccounts(@Query() query: any) {
+    return this.api.listAccounts(query);
+  }
+
+  // GET /api/v1/accounts/:id/automation — the page's editorial brief:
+  // entities, listening sources, caption DNA, card styling, posting budget.
+  // `null` when the page has not been set up for automation.
+  @Get("accounts/:id/automation")
+  getAutomation(@Param("id") id: string) {
+    return this.api.getAutomation(id);
+  }
+
+  // PUT /api/v1/accounts/:id/automation — create or REPLACE that brief.
+  // Full replace, not a merge: an omitted field means "remove it", so an edit
+  // that drops an entity is expressible. Send the whole object.
+  @Put("accounts/:id/automation")
+  putAutomation(@Param("id") id: string, @Body() body: any) {
+    return this.api.putAutomation(id, body);
   }
 
   // GET /api/v1/accounts/:id/posts — every post on the page (organic +
