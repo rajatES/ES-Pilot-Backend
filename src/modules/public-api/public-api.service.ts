@@ -1,4 +1,10 @@
-import { BadRequestException, Injectable, InternalServerErrorException, NotFoundException } from "@nestjs/common";
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  InternalServerErrorException,
+  NotFoundException,
+} from "@nestjs/common";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { PostsService } from "../posts/posts.service";
 import { UploadService } from "../upload/upload.service";
@@ -15,8 +21,23 @@ function inferMediaType(url: string): "image" | "video" {
   return VIDEO_EXT.test(url) ? "video" : "image";
 }
 
+// Review decisions (approvals rows) in the shape automations consume. The
+// reviewer's `comment` is the point: a rejection reason is the only signal that
+// says WHY something was turned down, and an automation that can read it can
+// stop producing that kind of post. Without it a caller only learns that its
+// output was rejected, which is not actionable.
+function toApiApproval(row: any) {
+  return {
+    action: row.action,
+    reviewer: row.reviewer || null,
+    comment: row.comment || null,
+    accountId: row.social_account_id || null,
+    at: row.created_at,
+  };
+}
+
 // Public shape for a post row + its targets — never leaks tokens or hashes.
-function toApiPost(post: any) {
+function toApiPost(post: any, approvals?: any[]) {
   return {
     id: post.id,
     content: post.body,
@@ -29,6 +50,7 @@ function toApiPost(post: any) {
     source: post.source || "app",
     status: post.status,
     approvalStatus: post.approval_status,
+    autoApproveAt: post.auto_approve_at || null,
     scheduledFor: post.scheduled_for,
     sentAt: post.sent_at,
     createdAt: post.created_at,
@@ -40,7 +62,11 @@ function toApiPost(post: any) {
       externalPostId: t.external_post_id,
       error: t.last_error,
       sentAt: t.sent_at,
+      // Per-page review audit — who resolved this page and when.
+      reviewedBy: t.reviewed_by || null,
+      reviewedAt: t.reviewed_at || null,
     })),
+    ...(approvals ? { approvals: approvals.map(toApiApproval) } : {}),
   };
 }
 
@@ -74,7 +100,62 @@ export class PublicApiService {
   }
 
   // POST /api/v1/posts — create + publish/schedule/queue/review/draft.
-  async createPost(payload: any, profile: any, apiKey: any = null) {
+  //
+  // `idempotencyKey` (from the Idempotency-Key header) makes a retried request
+  // safe: a network blip, a client-side retry, or two workers racing the same
+  // job must not produce two live posts. The claim row is written BEFORE the
+  // post, so the second caller loses on the unique index rather than
+  // discovering the duplicate afterwards.
+  async createPost(payload: any, profile: any, apiKey: any = null, idempotencyKey?: string) {
+    const key = (idempotencyKey || "").trim();
+    if (!key) return this.doCreatePost(payload, profile, apiKey);
+
+    const db = this.supabaseService.createServiceClient();
+    const { error: claimError } = await db.from("api_idempotency").insert({
+      user_id: OWNER_ID,
+      idempotency_key: key,
+      api_key_id: apiKey?.id || null,
+      post_id: null,
+    });
+
+    if (claimError) {
+      // Someone already claimed this key. Either the original post exists (a
+      // genuine replay — return it), or the first request is still running.
+      const { data: existing } = await db
+        .from("api_idempotency")
+        .select("post_id")
+        .eq("user_id", OWNER_ID)
+        .eq("idempotency_key", key)
+        .maybeSingle();
+      if (!existing) {
+        // The insert failed for some reason other than the unique index.
+        throw new InternalServerErrorException(`Idempotency claim failed: ${claimError.message}`);
+      }
+      if (!existing.post_id) {
+        throw new ConflictException(
+          "A request with this Idempotency-Key is already in progress. Retry once it completes.",
+        );
+      }
+      return { ...(await this.getPost(existing.post_id)), idempotentReplay: true };
+    }
+
+    try {
+      const result = await this.doCreatePost(payload, profile, apiKey);
+      await db
+        .from("api_idempotency")
+        .update({ post_id: result.post?.id || null })
+        .eq("user_id", OWNER_ID)
+        .eq("idempotency_key", key);
+      return result;
+    } catch (err) {
+      // Release the claim so a corrected retry with the same key can proceed —
+      // otherwise a validation error would poison that key permanently.
+      await db.from("api_idempotency").delete().eq("user_id", OWNER_ID).eq("idempotency_key", key);
+      throw err;
+    }
+  }
+
+  private async doCreatePost(payload: any, profile: any, apiKey: any = null) {
     const p = payload || {};
 
     const content = (p.content ?? p.text ?? p.body ?? "").trim();
@@ -127,6 +208,24 @@ export class PublicApiService {
       );
     }
 
+    // Per-post auto-approve deadline. Only meaningful for a review submission:
+    // an automation that scores its own output wants a high-confidence item to
+    // clear in minutes and a borderline one to wait for a human, which one
+    // global setting cannot express. Omitted → the shared window applies;
+    // explicit null → manual review only, whatever the global setting says.
+    let autoApproveAt: string | null | undefined;
+    if (p.autoApproveAt !== undefined) {
+      if (p.autoApproveAt === null) {
+        autoApproveAt = null;
+      } else {
+        const at = new Date(p.autoApproveAt);
+        if (Number.isNaN(at.getTime())) {
+          throw new BadRequestException("'autoApproveAt' must be an ISO-8601 datetime or null.");
+        }
+        autoApproveAt = at.toISOString();
+      }
+    }
+
     let scheduledFor = p.scheduledFor || null;
     if (scheduledFor) {
       const d = new Date(scheduledFor);
@@ -149,6 +248,7 @@ export class PublicApiService {
         socialAccountIds: accountIds,
         scheduledFor,
         saveAs,
+        autoApproveAt,
         // Optional per-platform overrides — sanitized/persisted by PostsService.
         platformCaptions: p.platformCaptions || null,
         platformOptions: p.platformOptions || null,
@@ -169,7 +269,8 @@ export class PublicApiService {
     };
   }
 
-  // GET /api/v1/posts/:id
+  // GET /api/v1/posts/:id — includes the review decisions, so a caller can read
+  // WHY a post was rejected rather than only that it was.
   async getPost(id: string) {
     const db = this.supabaseService.createServiceClient();
     const { data: post, error } = await db
@@ -180,13 +281,26 @@ export class PublicApiService {
       .maybeSingle();
     if (error) throw new InternalServerErrorException(error.message);
     if (!post) throw new NotFoundException("Post not found.");
-    return { post: toApiPost(post) };
+
+    const { data: approvals } = await db
+      .from("approvals")
+      .select("action, reviewer, comment, social_account_id, created_at")
+      .eq("post_id", id)
+      .order("created_at", { ascending: true });
+
+    return { post: toApiPost(post, approvals || []) };
   }
 
-  // GET /api/v1/posts?limit=&status=
+  // GET /api/v1/posts?limit=&status=&approvalStatus=&source=&since=
   async listPosts(query: any) {
     const limit = Math.min(Math.max(parseInt(query?.limit, 10) || 25, 1), 100);
     const status = (query?.status || "").trim();
+    // `status` and `approval_status` are different axes: a rejected post keeps a
+    // lifecycle status of its own, so filtering rejections needs this second
+    // filter. Without it there is no way to ask the API "what got turned down".
+    const approvalStatus = (query?.approvalStatus || "").trim();
+    const source = (query?.source || "").trim();
+    const since = (query?.since || "").trim();
 
     const db = this.supabaseService.createServiceClient();
     let q = db
@@ -196,10 +310,107 @@ export class PublicApiService {
       .order("scheduled_for", { ascending: false })
       .limit(limit);
     if (status) q = q.eq("status", status);
+    if (approvalStatus) q = q.eq("approval_status", approvalStatus);
+    if (source) q = q.eq("source", source);
+    if (since) {
+      const at = new Date(since);
+      if (Number.isNaN(at.getTime())) {
+        throw new BadRequestException("'since' must be an ISO-8601 datetime.");
+      }
+      q = q.gte("scheduled_for", at.toISOString());
+    }
 
     const { data, error } = await q;
     if (error) throw new InternalServerErrorException(error.message);
-    return { posts: (data || []).map(toApiPost) };
+    return { posts: (data || []).map((post: any) => toApiPost(post)) };
+  }
+
+  // GET /api/v1/accounts/:id/posts — EVERY post on a connected page, organic
+  // and app-published alike, from the platform-sync table.
+  //
+  // This is the endpoint an automation needs to see what a page actually looks
+  // like: what its human editors posted recently (the quality bar it should
+  // match), what it has already covered (so it doesn't repeat a subject), and
+  // what its captions have already said (so it doesn't ship a near-duplicate).
+  // `GET /v1/posts` cannot answer any of that — it only knows about posts this
+  // app created.
+  //
+  // `origin` is the load-bearing field: `app` marks a post this workspace
+  // published (with `source` naming which surface — composer vs Developer API),
+  // `organic` marks one that appeared on the page by other means. An automation
+  // grading itself against its own past output learns nothing; it needs to know
+  // which posts were human work.
+  async listAccountPosts(accountId: string, query: any) {
+    const limit = Math.min(Math.max(parseInt(query?.limit, 10) || 50, 1), 200);
+    const since = (query?.since || "").trim();
+
+    const db = this.supabaseService.createServiceClient();
+    const { data: account } = await db
+      .from("social_accounts")
+      .select("id, display_name, platform")
+      .eq("id", accountId)
+      .eq("user_id", OWNER_ID)
+      .maybeSingle();
+    if (!account) throw new NotFoundException("Account not found — see GET /api/v1/accounts.");
+
+    let q = db
+      .from("social_posts")
+      .select("*")
+      .eq("social_account_id", accountId)
+      .order("posted_at", { ascending: false })
+      .limit(limit);
+    if (since) {
+      const at = new Date(since);
+      if (Number.isNaN(at.getTime())) {
+        throw new BadRequestException("'since' must be an ISO-8601 datetime.");
+      }
+      q = q.gte("posted_at", at.toISOString());
+    }
+
+    const { data, error } = await q;
+    if (error) throw new InternalServerErrorException(error.message);
+    const posts = data || [];
+
+    // Provenance is resolved with a second query rather than a join: the two
+    // tables are linked by the platform's own post id, not by a foreign key, so
+    // the embedded-select shim cannot express it. Matching in memory over one
+    // page of results is cheap and keeps the query layer untouched.
+    const externalIds = posts.map((p: any) => p.external_post_id).filter(Boolean);
+    const originByExternalId = new Map<string, string>();
+    if (externalIds.length) {
+      const { data: targets } = await db
+        .from("post_targets")
+        .select("external_post_id, scheduled_posts(source)")
+        .eq("social_account_id", accountId)
+        .in("external_post_id", externalIds);
+      for (const t of targets || []) {
+        if (t.external_post_id) {
+          originByExternalId.set(t.external_post_id, t.scheduled_posts?.source || "app");
+        }
+      }
+    }
+
+    return {
+      account: { id: account.id, name: account.display_name, platform: account.platform },
+      posts: posts.map((p: any) => ({
+        externalPostId: p.external_post_id,
+        postType: p.post_type,
+        message: p.message,
+        mediaUrl: p.media_url,
+        permalink: p.permalink,
+        postedAt: p.posted_at,
+        origin: originByExternalId.has(p.external_post_id) ? "app" : "organic",
+        source: originByExternalId.get(p.external_post_id) || null,
+        metrics: {
+          likes: p.likes,
+          comments: p.comments,
+          shares: p.shares,
+          reach: p.reach,
+          impressions: p.impressions,
+          totalInteractions: p.total_interactions,
+        },
+      })),
+    };
   }
 
   // DELETE /api/v1/posts/:id — same semantics as deleting in the app.

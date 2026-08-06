@@ -106,6 +106,7 @@ export class PostsService {
       platformOptions: platformOptionsInput,
       source,
       apiKeyId,
+      autoApproveAt,
     } = payload || {};
     const accountIds = Array.isArray(socialAccountIds) ? socialAccountIds : [];
     // Origin: "app" (composer, default) unless a caller passes it — the external
@@ -145,7 +146,20 @@ export class PostsService {
           // Review posts inherit the shared auto-approve grace window (null when
           // auto-approve is off) — so API/composer submissions behave the same
           // as the in-app "Submit for review".
-          auto_approve_at: saveAs === "review" ? await computeAutoApproveAt(supabase, OWNER_ID) : null,
+          //
+          // A caller may override that window per post by passing `autoApproveAt`
+          // (an ISO string, or null for "hold for a human however the global
+          // setting is configured"). Only the Developer API sets it today: an
+          // automation that scores its own output wants a confident item to clear
+          // in minutes and a borderline one to wait for review, and one global
+          // window cannot express both. `undefined` means "not specified" and
+          // keeps the shared setting — note the distinction from an explicit null.
+          auto_approve_at:
+            saveAs === "review"
+              ? autoApproveAt !== undefined
+                ? autoApproveAt
+                : await computeAutoApproveAt(supabase, OWNER_ID)
+              : null,
           content_type: contentType || null,
           template_id: templateId || null,
           first_comment: firstComment || null,

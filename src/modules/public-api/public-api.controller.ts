@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Headers,
   HttpCode,
   Param,
   Post,
@@ -32,11 +33,26 @@ export class PublicApiController {
     return this.api.listAccounts();
   }
 
+  // GET /api/v1/accounts/:id/posts — every post on the page (organic +
+  // app-published), for automations that need to see what a page actually
+  // looks like before adding to it.
+  @Get("accounts/:id/posts")
+  listAccountPosts(@Param("id") id: string, @Query() query: any) {
+    return this.api.listAccountPosts(id, query);
+  }
+
   // POST /api/v1/posts — create a post (publish now / schedule / queue / review / draft).
+  // Send an `Idempotency-Key` header to make a retry safe: the same key always
+  // resolves to the same post instead of creating a second one.
   @Post("posts")
   @HttpCode(201)
-  createPost(@Body() body: any, @CurrentProfile() profile: any, @CurrentApiKey() apiKey: any) {
-    return this.api.createPost(body, profile, apiKey);
+  createPost(
+    @Body() body: any,
+    @CurrentProfile() profile: any,
+    @CurrentApiKey() apiKey: any,
+    @Headers("idempotency-key") idempotencyKey?: string,
+  ) {
+    return this.api.createPost(body, profile, apiKey, idempotencyKey);
   }
 
   // GET /api/v1/posts — recent posts with per-account delivery status.

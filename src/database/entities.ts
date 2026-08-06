@@ -770,6 +770,36 @@ export class ApiKey {
   created_at: Date;
 }
 
+// ── Developer API idempotency claims ─────────────────────────────────────
+// One row per `Idempotency-Key` seen on POST /api/v1/posts. The unique index on
+// (user_id, idempotency_key) is what actually prevents a duplicate post: a
+// retried or double-fired automation request loses the race on INSERT instead
+// of creating a second post. `post_id` is filled in once the post exists, so a
+// replay can return the original; a claim with a null `post_id` means the first
+// request is still in flight.
+@Entity("api_idempotency")
+@Unique(["user_id", "idempotency_key"])
+export class ApiIdempotency {
+  @PrimaryGeneratedColumn("uuid")
+  id: string;
+
+  @Index()
+  @Column({ name: "user_id", type: "uuid" })
+  user_id: string;
+
+  @Column({ name: "idempotency_key", type: "text" })
+  idempotency_key: string;
+
+  @Column({ name: "api_key_id", type: "uuid", nullable: true })
+  api_key_id: string | null;
+
+  @Column({ name: "post_id", type: "uuid", nullable: true })
+  post_id: string | null;
+
+  @CreateDateColumn({ name: "created_at", type: "timestamptz" })
+  created_at: Date;
+}
+
 export const ALL_ENTITIES = [
   Profile,
   Division,
@@ -791,4 +821,5 @@ export const ALL_ENTITIES = [
   UserIntegration,
   Campaign,
   ApiKey,
+  ApiIdempotency,
 ];
