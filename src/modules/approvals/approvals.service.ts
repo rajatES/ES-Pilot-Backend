@@ -14,6 +14,7 @@ import { publishXPost, postXReply } from "../../lib/x";
 import { publishYouTubeVideo } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
 import { postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
+import { noteAccountPublishFailure, clearAccountPublishFailure } from "../../lib/accountHealth";
 // @ts-ignore - plain JS fact-check gate (env-gated, fail-open, no-op without a key).
 import { factCheckCaption, factCheckEnabled } from "../../lib/factcheck";
 // @ts-ignore - shared auto-approve deadline helper (also used by posts.create).
@@ -329,9 +330,12 @@ export class ApprovalsService {
           }
         }
 
+        if (targetStatus === "sent") await clearAccountPublishFailure(account);
+
         results.push({ accountId: account.id, name: account.display_name, status: targetStatus });
       } catch (err) {
         await supabase.from("post_targets").update({ status: "failed", last_error: err.message, ...review() }).eq("id", target.id);
+        await noteAccountPublishFailure(account, err.message);
         results.push({ accountId: account.id, name: account.display_name, status: "failed", error: err.message });
       }
     }

@@ -7,6 +7,7 @@ import {
 } from "@nestjs/common";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { logActivity } from "../../lib/activity";
+import { metaErrorMessage } from "../../lib/metaError";
 
 const GRAPH = "https://graph.facebook.com/v23.0";
 
@@ -127,6 +128,13 @@ export class AccountsService {
   }
 
   // POST /api/accounts/sync — refresh followers / likes / token health via Graph API.
+  //
+  // This is a PUBLISH-capability check, not just a read. A page token keeps
+  // answering read queries (followers, insights) long after it has lost the
+  // right to post, so the old followers-only probe reported "Healthy" for
+  // pages whose every scheduled post was failing. For Facebook we now also ask
+  // for `tasks` — the permissions the token actually holds on that page — and
+  // treat a missing CREATE_CONTENT as unhealthy.
   async sync(payload: any) {
     const supabase = this.supabaseService.createServiceClient();
     const ids = Array.isArray(payload?.ids) ? payload.ids : null;
@@ -146,32 +154,68 @@ export class AccountsService {
             `${GRAPH}/${a.external_account_id}?fields=followers_count,media_count,username&access_token=${a.access_token}`,
           );
           const dd = await r.json();
-          if (!r.ok) throw new Error(dd?.error?.message || "Sync failed");
+          if (!r.ok) throw new Error(metaErrorMessage(dd, "Sync failed"));
           followers = dd.followers_count ?? null;
-        } else {
+        } else if (a.platform === "facebook") {
           const r = await fetch(
-            `${GRAPH}/${a.external_account_id}?fields=followers_count,fan_count,name&access_token=${a.access_token}`,
+            `${GRAPH}/${a.external_account_id}?fields=followers_count,fan_count,name,tasks&access_token=${a.access_token}`,
           );
           const dd = await r.json();
-          if (!r.ok) throw new Error(dd?.error?.message || "Sync failed");
+          if (!r.ok) throw new Error(metaErrorMessage(dd, "Sync failed"));
           followers = dd.followers_count ?? null;
           likes = dd.fan_count ?? null;
+          // Only judge when Graph actually returned the field — treating an
+          // absent `tasks` as "can't publish" would flag healthy pages.
+          if (Array.isArray(dd.tasks) && !dd.tasks.includes("CREATE_CONTENT")) {
+            throw new Error(
+              "This token can no longer create content on the Page (missing CREATE_CONTENT). Reconnect the Page to restore publishing.",
+            );
+          }
+        } else {
+          // Non-Meta platforms (YouTube/X/Threads) have their own token flows —
+          // leave their health untouched rather than guessing from a Graph call.
+          results.push({ id: a.id, ok: true, skipped: true });
+          continue;
         }
+
+        const metadata = { ...(a.metadata || {}) };
+        delete metadata.auth_error;
         await supabase
           .from("social_accounts")
-          .update({ followers, page_likes: likes, last_synced_at: new Date().toISOString(), publishing_ok: true })
+          .update({
+            followers,
+            page_likes: likes,
+            last_synced_at: new Date().toISOString(),
+            publishing_ok: true,
+            metadata,
+          })
           .eq("id", a.id);
         results.push({ id: a.id, ok: true });
       } catch (e) {
         await supabase
           .from("social_accounts")
-          .update({ publishing_ok: false, last_synced_at: new Date().toISOString() })
+          .update({
+            publishing_ok: false,
+            last_synced_at: new Date().toISOString(),
+            metadata: {
+              ...(a.metadata || {}),
+              auth_error: { message: e.message, at: new Date().toISOString() },
+            },
+          })
           .eq("id", a.id);
         results.push({ id: a.id, ok: false, error: e.message });
       }
     }
 
-    await logActivity({ type: "account.synced", title: `Synced ${results.length} account(s)`, status: "info" });
+    const broken = results.filter((r) => !r.ok);
+    await logActivity({
+      type: "account.synced",
+      title: broken.length
+        ? `Synced ${results.length} account(s) — ${broken.length} need reconnecting`
+        : `Synced ${results.length} account(s)`,
+      status: broken.length ? "warning" : "info",
+      meta: broken.length ? { broken: broken.map((b) => ({ id: b.id, error: b.error })) } : {},
+    });
 
     const { data: updated } = await supabase
       .from("social_accounts")

@@ -8,6 +8,7 @@ import { publishYouTubeVideo } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
 import { runCompliance } from "../../lib/compliance";
+import { noteAccountPublishFailure, clearAccountPublishFailure } from "../../lib/accountHealth";
 import {
   postForPlatform,
   platformOptions,
@@ -165,6 +166,8 @@ export class PublishNowService {
           }
         }
 
+        await clearAccountPublishFailure(account);
+
         results.push({ accountId: account.id, name: account.display_name, status: "sent", mode: publishResult.mode });
       } catch (publishError) {
         await supabase
@@ -172,6 +175,7 @@ export class PublishNowService {
           .update({ status: "failed", last_error: publishError.message })
           .eq("post_id", post.id)
           .eq("social_account_id", account.id);
+        await noteAccountPublishFailure(account, publishError.message);
 
         results.push({ accountId: account.id, name: account.display_name, status: "failed", error: publishError.message });
       }

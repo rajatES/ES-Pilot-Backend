@@ -76,7 +76,14 @@ export class SocialService {
       throw new BadRequestException("No Pages selected.");
     }
 
-    const expiresAt = new Date(Date.now() + 60 * 24 * 60 * 60 * 1000).toISOString();
+    // Page tokens minted from a LONG-LIVED user token do not expire on a clock —
+    // they die when access is revoked (password change, checkpoint, lost Page
+    // role, app-role removal in dev mode). The old code stamped a fabricated
+    // "now + 60 days" here, which made the Accounts health badge report a
+    // countdown that meant nothing and hid tokens that had already died. Leave
+    // it null and let the real publish-capability probe in accounts.sync()
+    // (plus publish-time failures) decide whether a page is healthy.
+    const expiresAt = null;
 
     const connectedVia = grantor?.fb_user_id
       ? {

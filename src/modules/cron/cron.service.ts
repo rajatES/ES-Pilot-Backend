@@ -10,6 +10,7 @@ import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
 import { postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
 import { buildPostInsightRow } from "../../lib/postInsightRow";
+import { noteAccountPublishFailure, clearAccountPublishFailure } from "../../lib/accountHealth";
 import { ApprovalsService } from "../approvals/approvals.service";
 import { SocialSyncService } from "../insights/social-sync.service";
 
@@ -114,6 +115,8 @@ export class CronService {
             })
             .eq("id", target.id);
           published++;
+          // A publish proves the token still works — lift any earlier flag.
+          await clearAccountPublishFailure(account);
 
           // Stories have no comments — skip the first comment for them.
           const isStory = account.platform === "facebook" && fbFormat(post) === "story";
@@ -135,6 +138,10 @@ export class CronService {
         } catch (err) {
           await supabase.from("post_targets").update({ status: "failed", last_error: err.message }).eq("id", target.id);
           failed++;
+          // Token/permission/restriction failures are about the page, not this
+          // post — mark it so the UI says "reconnect" instead of failing every
+          // future post to it with the same opaque message.
+          await noteAccountPublishFailure(account, err.message);
           await logActivity({
             type: "post.failed",
             title: `Queued post failed on ${account.display_name}`,

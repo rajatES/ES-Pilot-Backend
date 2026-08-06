@@ -16,3 +16,5 @@ declare module "*/lib/facebookOAuth";
 declare module "*/lib/postContent";
 declare module "*/lib/threads";
 declare module "*/lib/x";
+declare module "*/lib/metaError";
+declare module "*/lib/accountHealth";

@@ -33,6 +33,7 @@ import {
 } from "../../lib/postContent";
 // @ts-ignore - shared auto-approve deadline helper.
 import { computeAutoApproveAt } from "../../lib/approvalSettings";
+import { noteAccountPublishFailure, clearAccountPublishFailure } from "../../lib/accountHealth";
 
 // Facebook's native scheduler only accepts times 10 min – 30 days out.
 // Anything sooner than 10 min (or in the past) we just publish immediately.
@@ -367,6 +368,8 @@ export class PostsService {
           }
         }
 
+        if (targetStatus === "sent") await clearAccountPublishFailure(account);
+
         results.push({
           accountId: account.id,
           name: account.display_name,
@@ -379,6 +382,7 @@ export class PostsService {
           .update({ status: "failed", last_error: err.message })
           .eq("post_id", post.id)
           .eq("social_account_id", account.id);
+        await noteAccountPublishFailure(account, err.message);
 
         results.push({ accountId: account.id, name: account.display_name, status: "failed", error: err.message });
       }
