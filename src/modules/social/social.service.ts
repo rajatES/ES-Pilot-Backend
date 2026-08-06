@@ -112,6 +112,13 @@ export class SocialService {
         access_token: page.access_token,
         token_expires_at: expiresAt,
         category: detectSport(page.name),
+        // Reconnecting IS the fix for a page flagged as unable to publish, so
+        // clear the flag here. The upsert only touches columns present in this
+        // row, so without this a page stayed "Reconnect needed" even after a
+        // successful reconnect — until the next publish or sync happened to
+        // clear it. Dropping the old metadata.auth_error falls out of the
+        // metadata rewrite below.
+        publishing_ok: true,
         metadata: { source: "facebook_js_sdk", platform, ...(connectedVia ? { connected_via: connectedVia } : {}) },
       };
     });
