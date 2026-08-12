@@ -16,6 +16,12 @@ import {
   sanitizePlatformCaptions,
   sanitizePlatformOptions,
 } from "../../lib/postContent";
+import {
+  CONTENT_TYPES_HINT,
+  isValidContentType,
+  normalizeContentType,
+  resolveFirstComment,
+} from "../../lib/postFields";
 
 @Injectable()
 export class PublishNowService {
@@ -24,13 +30,27 @@ export class PublishNowService {
   async publish(payload: any, author: any) {
     const supabase = this.supabaseService.createServiceClient();
 
-    const { body, imageUrl, media, linkUrl, socialAccountIds, firstComment, contentType, templateId } = payload || {};
+    const { body, imageUrl, media, linkUrl, socialAccountIds, firstComment, linkInComment, contentType, templateId } =
+      payload || {};
     const pCaptions = sanitizePlatformCaptions(payload?.platformCaptions);
     const pOptions = sanitizePlatformOptions(payload?.platformOptions);
 
     if (!body?.trim() || !socialAccountIds?.length) {
       throw new BadRequestException("Post text and at least one Page are required.");
     }
+
+    const cType = normalizeContentType(contentType);
+    if (!isValidContentType(cType)) {
+      throw new BadRequestException(`Invalid contentType "${contentType}" — use ${CONTENT_TYPES_HINT}.`);
+    }
+
+    // Workspace "link in first comment" policy — same resolution as posts.create,
+    // so publish-now and schedule produce the same comment. See lib/postFields.js.
+    const resolvedFirstComment = await resolveFirstComment(supabase, OWNER_ID, {
+      firstComment,
+      linkUrl,
+      linkInComment,
+    });
 
     // Ordered media list — imageUrl is the legacy single-image field.
     const mediaList = (Array.isArray(media) ? media : [])
@@ -68,7 +88,7 @@ export class PublishNowService {
     }
 
     // Compliance is advisory only — flags shown in UI but never block publishing.
-    runCompliance({ body, linkUrl, imageUrl: firstImage, contentType, accounts });
+    runCompliance({ body, linkUrl, imageUrl: firstImage, contentType: cType, accounts });
 
     const now = new Date().toISOString();
 
@@ -80,8 +100,8 @@ export class PublishNowService {
         image_url: firstImage,
         media: mediaList.length ? mediaList : null,
         link_url: linkUrl || null,
-        first_comment: firstComment || null,
-        content_type: contentType || null,
+        first_comment: resolvedFirstComment,
+        content_type: cType || null,
         template_id: templateId || null,
         platform_captions: pCaptions,
         platform_options: pOptions,
@@ -150,16 +170,16 @@ export class PublishNowService {
         // Best-effort first comment — never fails the publish itself.
         // (Stories have no comments — skip them.)
         const isStory = account.platform === "facebook" && fbFormat(post) === "story";
-        if (!isStory && firstComment?.trim() && publishResult.externalPostId) {
+        if (!isStory && resolvedFirstComment && publishResult.externalPostId) {
           try {
             if (account.platform === "instagram") {
-              await postInstagramComment({ account, mediaId: publishResult.externalPostId, message: firstComment });
+              await postInstagramComment({ account, mediaId: publishResult.externalPostId, message: resolvedFirstComment });
             } else if (account.platform === "threads") {
-              await postThreadsReply({ account, mediaId: publishResult.externalPostId, message: firstComment });
+              await postThreadsReply({ account, mediaId: publishResult.externalPostId, message: resolvedFirstComment });
             } else if (account.platform === "twitter") {
-              await postXReply({ account, tweetId: publishResult.externalPostId, message: firstComment });
+              await postXReply({ account, tweetId: publishResult.externalPostId, message: resolvedFirstComment });
             } else if (account.platform !== "youtube") {
-              await postFacebookComment({ account, postId: publishResult.externalPostId, message: firstComment });
+              await postFacebookComment({ account, postId: publishResult.externalPostId, message: resolvedFirstComment });
             }
           } catch (commentError) {
             console.warn(`[publish-now] first comment failed for ${account.display_name}:`, commentError.message);

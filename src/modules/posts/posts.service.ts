@@ -31,6 +31,14 @@ import {
   sanitizePlatformCaptions,
   sanitizePlatformOptions,
 } from "../../lib/postContent";
+import {
+  CONTENT_TYPES_HINT,
+  composeFirstComment,
+  isValidContentType,
+  linkInFirstCommentEnabled,
+  normalizeContentType,
+  resolveFirstComment,
+} from "../../lib/postFields";
 // @ts-ignore - shared auto-approve deadline helper.
 import { computeAutoApproveAt } from "../../lib/approvalSettings";
 import { noteAccountPublishFailure, clearAccountPublishFailure } from "../../lib/accountHealth";
@@ -101,6 +109,7 @@ export class PostsService {
       contentType,
       templateId,
       firstComment,
+      linkInComment,
       saveAs,
       platformCaptions,
       platformOptions: platformOptionsInput,
@@ -125,6 +134,21 @@ export class PostsService {
     if (!mediaList.length && imageUrl) mediaList.push({ url: imageUrl, type: "image" });
     // First image doubles as the thumbnail in calendar/queue cards.
     const firstImage = mediaList.find((m) => m.type === "image")?.url || null;
+
+    const cType = normalizeContentType(contentType);
+    if (!isValidContentType(cType)) {
+      throw new BadRequestException(`Invalid contentType "${contentType}" — use ${CONTENT_TYPES_HINT}.`);
+    }
+
+    // The workspace "link in first comment" policy is applied here rather than in
+    // the composer, so the Developer API and CSV import honor it too. `linkInComment`
+    // overrides the setting for this post; the append is idempotent, so the link the
+    // composer already added client-side is not duplicated. See lib/postFields.js.
+    const resolvedFirstComment = await resolveFirstComment(supabase, OWNER_ID, {
+      firstComment,
+      linkUrl,
+      linkInComment,
+    });
 
     // Draft / submit-for-review: store without publishing or scheduling on Facebook.
     if (saveAs === "draft" || saveAs === "review") {
@@ -160,9 +184,9 @@ export class PostsService {
                 ? autoApproveAt
                 : await computeAutoApproveAt(supabase, OWNER_ID)
               : null,
-          content_type: contentType || null,
+          content_type: cType || null,
           template_id: templateId || null,
-          first_comment: firstComment || null,
+          first_comment: resolvedFirstComment,
           platform_captions: pCaptions,
           platform_options: pOptions,
           source: postSource,
@@ -252,7 +276,7 @@ export class PostsService {
 
     // Compliance is advisory only — flags are shown in the UI but never block
     // posting or scheduling. This is intentional during the iterative rollout.
-    runCompliance({ body, linkUrl, imageUrl: firstImage, contentType, accounts });
+    runCompliance({ body, linkUrl, imageUrl: firstImage, contentType: cType, accounts });
 
     const { data: post, error: postError } = await supabase
       .from("scheduled_posts")
@@ -262,9 +286,9 @@ export class PostsService {
         image_url: firstImage,
         media: mediaList.length ? mediaList : null,
         link_url: linkUrl || null,
-        content_type: contentType || null,
+        content_type: cType || null,
         template_id: templateId || null,
-        first_comment: firstComment || null,
+        first_comment: resolvedFirstComment,
         platform_captions: pCaptions,
         platform_options: pOptions,
         source: postSource,
@@ -366,16 +390,16 @@ export class PostsService {
         // since this route isn't invoked again when Facebook publishes it later.
         // Stories have no comments — skip them.
         const isStory = account.platform === "facebook" && fbFormat(post) === "story";
-        if (targetStatus === "sent" && !isStory && firstComment?.trim() && result.externalPostId) {
+        if (targetStatus === "sent" && !isStory && resolvedFirstComment && result.externalPostId) {
           try {
             if (account.platform === "instagram") {
-              await postInstagramComment({ account, mediaId: result.externalPostId, message: firstComment });
+              await postInstagramComment({ account, mediaId: result.externalPostId, message: resolvedFirstComment });
             } else if (account.platform === "threads") {
-              await postThreadsReply({ account, mediaId: result.externalPostId, message: firstComment });
+              await postThreadsReply({ account, mediaId: result.externalPostId, message: resolvedFirstComment });
             } else if (account.platform === "twitter") {
-              await postXReply({ account, tweetId: result.externalPostId, message: firstComment });
+              await postXReply({ account, tweetId: result.externalPostId, message: resolvedFirstComment });
             } else if (account.platform !== "youtube") {
-              await postFacebookComment({ account, postId: result.externalPostId, message: firstComment });
+              await postFacebookComment({ account, postId: result.externalPostId, message: resolvedFirstComment });
             }
           } catch (commentError) {
             console.warn(`[posts] first comment failed for ${account.display_name}:`, commentError.message);
@@ -676,7 +700,6 @@ export class PostsService {
   async importCsv(payload: any, author: any) {
     const supabase = this.supabaseService.createServiceClient();
     const MAX_ROWS = 200;
-    const CONTENT_TYPES = new Set(["infographic", "meme_image", "lic"]);
 
     const { rows } = payload || {};
     if (!Array.isArray(rows) || !rows.length) {
@@ -692,6 +715,8 @@ export class PostsService {
       .eq("user_id", OWNER_ID);
     if (acctError) throw new InternalServerErrorException(acctError.message);
     const byName = new Map((accounts || []).map((a) => [a.display_name.trim().toLowerCase(), a]));
+    // Read the workspace "link in first comment" policy once, not per row.
+    const appendLink = await linkInFirstCommentEnabled(supabase, OWNER_ID);
 
     let created = 0;
     const errors: any[] = [];
@@ -734,11 +759,11 @@ export class PostsService {
         continue;
       }
 
-      const contentTypeRaw = (row.contentType || "").trim().toLowerCase();
-      if (contentTypeRaw && !CONTENT_TYPES.has(contentTypeRaw)) {
+      const contentTypeRaw = normalizeContentType(row.contentType);
+      if (!isValidContentType(contentTypeRaw)) {
         errors.push({
           row: rowNum,
-          error: `Invalid content_type "${row.contentType}" — use infographic, meme_image, lic, or leave blank.`,
+          error: `Invalid content_type "${row.contentType}" — use ${CONTENT_TYPES_HINT}.`,
         });
         continue;
       }
@@ -759,7 +784,11 @@ export class PostsService {
           image_url: rowImage,
           media: rowMedia.length ? rowMedia : null,
           link_url: (row.linkUrl || "").trim() || null,
-          first_comment: (row.firstComment || "").trim() || null,
+          first_comment: composeFirstComment({
+            firstComment: row.firstComment,
+            linkUrl: row.linkUrl,
+            appendLink,
+          }),
           content_type: contentTypeRaw || null,
           scheduled_for: when.toISOString(),
           status: "scheduled",

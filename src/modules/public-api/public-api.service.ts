@@ -8,6 +8,7 @@ import {
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { PostsService } from "../posts/posts.service";
 import { UploadService } from "../upload/upload.service";
+import { CONTENT_TYPES_HINT, isValidContentType, normalizeContentType } from "../../lib/postFields";
 
 // External Developer API (v1) — the SocialPilot-style surface automations
 // call with an API key. Thin façade: normalizes the external payload shape,
@@ -449,6 +450,23 @@ export class PublicApiService {
       }
     }
 
+    // Content type is validated in PostsService.create (one vocabulary for every
+    // write path), but a typo like "LIC " or "link_in_comment" should fail here
+    // rather than persist and quietly drop the post out of the LIC bucket in
+    // team stats.
+    const contentType = normalizeContentType(p.contentType);
+    if (!isValidContentType(contentType)) {
+      throw new BadRequestException(`Unknown 'contentType' "${p.contentType}". Use ${CONTENT_TYPES_HINT}.`);
+    }
+
+    // Per-post override for the workspace "link in first comment" policy.
+    // Omitted → the workspace setting decides; true/false → force it for this
+    // post. An automation posting both link-bearing articles and standalone
+    // graphics needs to choose per post.
+    if (p.linkInComment !== undefined && p.linkInComment !== null && typeof p.linkInComment !== "boolean") {
+      throw new BadRequestException("'linkInComment' must be true or false.");
+    }
+
     // Disposition: draft | review | queue | scheduled | publish-now.
     const mode = (p.status || "").toString().toLowerCase();
     let saveAs: string | undefined;
@@ -497,7 +515,8 @@ export class PublicApiService {
         media,
         linkUrl: p.linkUrl || null,
         firstComment: p.firstComment || null,
-        contentType: p.contentType || null,
+        linkInComment: typeof p.linkInComment === "boolean" ? p.linkInComment : undefined,
+        contentType: contentType || null,
         socialAccountIds: accountIds,
         scheduledFor,
         saveAs,
