@@ -1,8 +1,9 @@
 // Postiz — publishing bridge for the platforms our own Meta apps can't reach:
 // **Threads** (Meta's Threads API needs its own app plus review, which we never
-// completed) and **personal / standalone Instagram** (the native path requires
-// an IG Business or Creator account linked to a Facebook Page, so a personal
-// profile structurally cannot be connected through it).
+// completed) and **standalone Instagram** (our native path requires the IG
+// account to be linked to a Facebook Page; "standalone" is Postiz's provider for
+// a professional account with NO such link. It still has to be a Creator or
+// Business account — no API publishes to a plain personal profile).
 //
 // Postiz owns the OAuth and the platform tokens for these channels; we hold a
 // single workspace API key. An account routed through here is a normal
@@ -242,6 +243,93 @@ export async function publishPostizPost({ account, post, options = {}, firstComm
     throw new Error("Postiz accepted the post but returned no post id, so it can't be tracked.");
   }
   return { externalPostId, firstCommentIncluded: !!firstComment?.trim() };
+}
+
+// ── Dry run (non-publishing pipeline check) ──────────────────────────────
+
+// Exercise the ENTIRE publish pipeline against a real channel without anything
+// reaching the platform: ingest media, create the post as a **draft**, then
+// delete it. Postiz's own docs on type:"draft" — "the post is created and
+// stored against the integration but not scheduled or published."
+//
+// This exists because the channels are production pages: the only honest way to
+// prove the integration works is to make the real calls with the real payload,
+// and a draft is the one mode where that is safe. It reuses buildValue /
+// buildSettings so what this validates is exactly what a real publish sends —
+// a separate hand-written payload here could pass while production failed.
+//
+// Returns { steps: [{ name, ok, detail }], ok } and never throws.
+export async function dryRunPostizChannel({ account, mediaUrl = null, keepDraft = false }) {
+  const steps = [];
+  const record = (name, ok, detail) => {
+    steps.push({ name, ok, detail });
+    return ok;
+  };
+
+  const provider = account?.metadata?.postiz?.provider || account?.provider;
+  const platform = POSTIZ_PROVIDERS[provider] || account?.platform;
+  const integrationId = account?.external_account_id || account?.id;
+
+  if (!provider || !integrationId) {
+    record("resolve channel", false, "missing Postiz provider or integration id");
+    return { steps, ok: false };
+  }
+  record("resolve channel", true, `${provider} → platform "${platform}", integration ${integrationId}`);
+
+  // Media ingest. Instagram needs media on a real publish, so prove the S3-URL
+  // handoff works; Threads is text-only here, which is its realistic case.
+  let uploaded = [];
+  if (mediaUrl) {
+    try {
+      const file = await ingestMedia(mediaUrl);
+      uploaded = [file];
+      record("upload-from-url", true, `file id ${file.id}`);
+    } catch (e) {
+      record("upload-from-url", false, e.message);
+    }
+  } else {
+    record("upload-from-url", true, "skipped (no media URL given)");
+  }
+
+  const settings = buildSettings({ provider, platform, igFormat: "feed" });
+  const value = buildValue({
+    caption: "Pilot integration check — draft only, never published.",
+    media: platform === "instagram" ? uploaded : [],
+    firstComment: "Pilot integration check — first-comment path.",
+  });
+  record("build payload", true, `settings ${JSON.stringify(settings)}, ${value.length} value entr${value.length === 1 ? "y" : "ies"} (2nd = first comment)`);
+
+  let draftId = null;
+  try {
+    const created = await postizFetch("/posts", {
+      method: "POST",
+      body: {
+        type: "draft",
+        date: new Date().toISOString(),
+        shortLink: false,
+        tags: [],
+        posts: [{ integration: { id: integrationId }, value, settings }],
+      },
+    });
+    const row = Array.isArray(created) ? created[0] : created?.posts?.[0] || created;
+    draftId = row?.postId || row?.id || null;
+    record("create draft", !!draftId, draftId ? `draft id ${draftId}` : `accepted but returned no id: ${JSON.stringify(created)}`);
+  } catch (e) {
+    record("create draft", false, e.message);
+  }
+
+  if (draftId && !keepDraft) {
+    try {
+      const res = await deletePostizPost({ externalPostId: draftId });
+      record("delete draft", true, res.alreadyGone ? "already gone (404)" : "removed");
+    } catch (e) {
+      record("delete draft", false, `${e.message} — draft ${draftId} may still be in Postiz`);
+    }
+  } else if (draftId) {
+    record("delete draft", true, `kept on request (draft ${draftId})`);
+  }
+
+  return { steps, ok: steps.every((s) => s.ok) };
 }
 
 // ── Status ───────────────────────────────────────────────────────────────
