@@ -3,13 +3,13 @@ import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { publishFacebookPost, publishFacebookReel, publishFacebookStory, postFacebookComment } from "../../lib/facebook";
 import { publishInstagramPost, postInstagramComment } from "../../lib/instagram";
 import { publishPostizPost } from "../../lib/postiz";
-import { publishXPost, postXReply } from "../../lib/x";
 import { publishYouTubeVideo } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
 import { runCompliance } from "../../lib/compliance";
 import { noteAccountPublishFailure, clearAccountPublishFailure } from "../../lib/accountHealth";
 import {
+  assertPublishable,
   postForPlatform,
   platformOptions,
   fbFormat,
@@ -144,11 +144,13 @@ export class PublishNowService {
           media: mediaList,
           link_url: outboundLink,
         };
+        assertPublishable(account);
+
         const publishResult =
-          // Threads / personal Instagram go through Postiz. Tested first: such an
-          // account keeps its real platform value, so it would otherwise fall
-          // into the native Instagram branch. Postiz has no add-comment
-          // endpoint, so the first comment travels with the post.
+          // Threads / standalone Instagram / X go through Postiz. Tested first:
+          // such an account keeps its real platform value, so it would otherwise
+          // fall into a native branch. Postiz has no add-comment endpoint, so
+          // the first comment travels with the post.
           account.publish_via === "postiz"
             ? await publishPostizPost({
                 account,
@@ -158,15 +160,13 @@ export class PublishNowService {
               })
             : account.platform === "instagram"
               ? await publishInstagramPost({ account, post: postData })
-              : account.platform === "twitter"
-                ? await publishXPost({ account, post: postData })
-                : account.platform === "youtube"
-                  ? await publishYouTubeVideo({ account, post: postData, options: platformOptions(post, "youtube") } as any)
-                  : fbFormat(post) === "reel"
-                    ? await publishFacebookReel({ account, post: postData })
-                    : fbFormat(post) === "story"
-                      ? await publishFacebookStory({ account, post: postData })
-                      : await publishFacebookPost({ account, post: postData });
+              : account.platform === "youtube"
+                ? await publishYouTubeVideo({ account, post: postData, options: platformOptions(post, "youtube") } as any)
+                : fbFormat(post) === "reel"
+                  ? await publishFacebookReel({ account, post: postData })
+                  : fbFormat(post) === "story"
+                    ? await publishFacebookStory({ account, post: postData })
+                    : await publishFacebookPost({ account, post: postData });
 
         const sentAt = new Date().toISOString();
 
@@ -184,9 +184,7 @@ export class PublishNowService {
           try {
             if (account.platform === "instagram") {
               await postInstagramComment({ account, mediaId: publishResult.externalPostId, message: resolvedFirstComment });
-            } else if (account.platform === "twitter") {
-              await postXReply({ account, tweetId: publishResult.externalPostId, message: resolvedFirstComment });
-            } else if (account.platform !== "youtube") {
+            } else if (account.platform === "facebook") {
               await postFacebookComment({ account, postId: publishResult.externalPostId, message: resolvedFirstComment });
             }
           } catch (commentError) {

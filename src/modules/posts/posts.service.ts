@@ -19,12 +19,12 @@ import {
 } from "../../lib/facebook";
 import { publishInstagramPost, postInstagramComment, checkInstagramPostStatus } from "../../lib/instagram";
 import { publishPostizPost, reconcilePostizTarget } from "../../lib/postiz";
-import { publishXPost, postXReply, checkXPostStatus } from "../../lib/x";
 import { publishYouTubeVideo, checkYouTubeVideoStatus, updateScheduledYouTubeVideo } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
 import { runCompliance } from "../../lib/compliance";
 import {
+  assertPublishable,
   postForPlatform,
   platformOptions,
   fbFormat,
@@ -341,12 +341,15 @@ export class PostsService {
           continue;
         }
 
+        assertPublishable(account);
+
         if (account.publish_via === "postiz") {
-          // Threads / personal Instagram, relayed through Postiz. Checked before
-          // the platform branches because such an account still carries its real
-          // platform ("threads"/"instagram") and must not reach the native libs.
-          // Postiz has no add-comment endpoint, so the first comment travels
-          // with the post and firstCommentIncluded tells the block below to skip.
+          // Threads / standalone Instagram / X, relayed through Postiz. Checked
+          // before the platform branches because such an account still carries
+          // its real platform ("threads"/"instagram"/"twitter") and must not
+          // reach the native libs. Postiz has no add-comment endpoint, so the
+          // first comment travels with the post and firstCommentIncluded tells
+          // the block below to skip its own.
           result = await publishPostizPost({
             account,
             post: postData,
@@ -367,10 +370,6 @@ export class PostsService {
           });
           targetStatus = publishNow ? "sent" : "scheduled";
           if (publishNow) sentAt = new Date().toISOString();
-        } else if (account.platform === "twitter") {
-          result = await publishXPost({ account, post: postData });
-          targetStatus = "sent";
-          sentAt = new Date().toISOString();
         } else if (account.platform === "instagram") {
           result = await publishInstagramPost({ account, post: postData });
           targetStatus = "sent";
@@ -406,9 +405,7 @@ export class PostsService {
           try {
             if (account.platform === "instagram") {
               await postInstagramComment({ account, mediaId: result.externalPostId, message: resolvedFirstComment });
-            } else if (account.platform === "twitter") {
-              await postXReply({ account, tweetId: result.externalPostId, message: resolvedFirstComment });
-            } else if (account.platform !== "youtube") {
+            } else if (account.platform === "facebook") {
               await postFacebookComment({ account, postId: result.externalPostId, message: resolvedFirstComment });
             }
           } catch (commentError) {
@@ -908,12 +905,10 @@ export class PostsService {
           } else if (account.platform === "instagram") {
             // IG/X posts are always live once sent — only existence matters.
             result = { ...(await checkInstagramPostStatus({ account, externalPostId: target.external_post_id })), isPublished: true };
-          } else if (account.platform === "twitter") {
-            result = { ...(await checkXPostStatus({ account, externalPostId: target.external_post_id })), isPublished: true };
           } else {
-            // Native Threads publishing was retired in favour of Postiz, which
-            // the branch above handles — nothing else should reach here, and
-            // exists:null leaves the target untouched if anything does.
+            // Native Threads and X publishing were retired in favour of Postiz,
+            // which the branch above handles — nothing else should reach here,
+            // and exists:null leaves the target untouched if anything does.
             result = { exists: null };
           }
         } catch {

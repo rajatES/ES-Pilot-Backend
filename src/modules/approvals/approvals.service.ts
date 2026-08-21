@@ -10,10 +10,9 @@ import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { publishFacebookPost, publishFacebookReel, publishFacebookStory, postFacebookComment } from "../../lib/facebook";
 import { publishInstagramPost, postInstagramComment } from "../../lib/instagram";
 import { publishPostizPost } from "../../lib/postiz";
-import { publishXPost, postXReply } from "../../lib/x";
 import { publishYouTubeVideo } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
-import { postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
+import { assertPublishable, postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
 import { noteAccountPublishFailure, clearAccountPublishFailure } from "../../lib/accountHealth";
 // @ts-ignore - plain JS fact-check gate (env-gated, fail-open, no-op without a key).
 import { factCheckCaption, factCheckEnabled } from "../../lib/factcheck";
@@ -276,11 +275,13 @@ export class ApprovalsService {
           continue;
         }
 
+        assertPublishable(account);
+
         if (account.publish_via === "postiz") {
-          // Threads / personal Instagram, relayed through Postiz. Tested before
-          // the platform branches because the account keeps its real platform
-          // value. Postiz has no add-comment endpoint, so the first comment goes
-          // out with the post and the block below skips its own.
+          // Threads / standalone Instagram / X, relayed through Postiz. Tested
+          // before the platform branches because the account keeps its real
+          // platform value. Postiz has no add-comment endpoint, so the first
+          // comment goes out with the post and the block below skips its own.
           result = await publishPostizPost({
             account,
             post: postData,
@@ -296,10 +297,6 @@ export class ApprovalsService {
           if (publishNow) sentAt = new Date().toISOString();
         } else if (account.platform === "instagram") {
           result = await publishInstagramPost({ account, post: postData });
-          targetStatus = "sent";
-          sentAt = new Date().toISOString();
-        } else if (account.platform === "twitter") {
-          result = await publishXPost({ account, post: postData });
           targetStatus = "sent";
           sentAt = new Date().toISOString();
         } else {
@@ -328,9 +325,7 @@ export class ApprovalsService {
           try {
             if (account.platform === "instagram") {
               await postInstagramComment({ account, mediaId: result.externalPostId, message: post.first_comment });
-            } else if (account.platform === "twitter") {
-              await postXReply({ account, tweetId: result.externalPostId, message: post.first_comment });
-            } else if (account.platform !== "youtube") {
+            } else if (account.platform === "facebook") {
               await postFacebookComment({ account, postId: result.externalPostId, message: post.first_comment });
             }
           } catch (commentError) {

@@ -7,8 +7,6 @@ import { getInstagramPostMetrics } from "../../lib/instagram";
 // @ts-ignore
 import { getPostizPostMetrics } from "../../lib/postiz";
 // @ts-ignore
-import { getXPostMetrics } from "../../lib/x";
-// @ts-ignore
 import { getYouTubeVideoAnalytics } from "../../lib/youtube";
 // @ts-ignore
 import { buildPostInsightRow } from "../../lib/postInsightRow";
@@ -380,7 +378,6 @@ export class InsightsService {
     // before looking at the platform at all.
     if (account?.publish_via === "postiz") return getPostizPostMetrics({ externalPostId });
     if (platform === "instagram") return getInstagramPostMetrics({ account, externalPostId });
-    if (platform === "twitter") return getXPostMetrics({ account, externalPostId });
     if (platform === "youtube") {
       const yt = await getYouTubeVideoAnalytics({ account, videoId: externalPostId });
       return { likes: yt.likes, comments: yt.comments, shares: 0, impressions: yt.views, reach: null, raw: yt.raw };

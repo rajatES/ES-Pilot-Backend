@@ -1,9 +1,18 @@
-// Postiz — publishing bridge for the platforms our own Meta apps can't reach:
-// **Threads** (Meta's Threads API needs its own app plus review, which we never
-// completed) and **standalone Instagram** (our native path requires the IG
-// account to be linked to a Facebook Page; "standalone" is Postiz's provider for
-// a professional account with NO such link. It still has to be a Creator or
-// Business account — no API publishes to a plain personal profile).
+// Postiz — publishing bridge for the platforms we can't (or no longer want to)
+// reach with our own developer apps:
+// - **Threads** — Meta's Threads API needs its own app plus review, never done.
+// - **Standalone Instagram** — our native path requires the IG account to be
+//   linked to a Facebook Page; "standalone" is Postiz's provider for a
+//   professional account with NO such link. Still must be a Creator or Business
+//   account: no API publishes to a plain personal profile.
+// - **X (Twitter)** — the native path was complete but never published a single
+//   post, because posting needs a paid API tier. Postiz already holds a working
+//   X authorization, so it publishes there instead and we no longer carry X's
+//   2-hour access tokens or its rotating refresh tokens.
+//
+// Facebook Pages stay NATIVE deliberately: that path works, and it carries
+// per-page tokens, grantor tracking, Reels/Stories and insights that Postiz
+// would not give us.
 //
 // Postiz owns the OAuth and the platform tokens for these channels; we hold a
 // single workspace API key. An account routed through here is a normal
@@ -31,6 +40,10 @@ export const POSTIZ_PROVIDERS = {
   threads: "threads",
   instagram: "instagram",
   "instagram-standalone": "instagram",
+  // Our schema has always called this platform "twitter"; Postiz calls the
+  // provider "x". The platform value stays "twitter" so PLATFORM_META, the
+  // X preview, platformRules and every existing row keep working.
+  x: "twitter",
 };
 
 function baseUrl() {
@@ -165,14 +178,30 @@ function buildValue({ caption, media, firstComment }) {
   return value;
 }
 
+// Reply audiences X accepts for who_can_reply_post. "everyone" is a normal
+// tweet, and is the default when a post doesn't say otherwise.
+export const X_REPLY_AUDIENCES = ["everyone", "following", "mentionedUsers", "subscribers", "verified"];
+
 // Per-provider `settings` object. Threads takes nothing beyond __type;
-// Instagram (both business-linked and standalone) needs a post_type.
-function buildSettings({ provider, platform, igFormat }) {
+// Instagram (both business-linked and standalone) needs a post_type; X needs a
+// reply audience, which Postiz treats as REQUIRED — omit it and the create call
+// is rejected, so it always gets an explicit value.
+function buildSettings({ provider, platform, igFormat, options = {} }) {
   const settings = { __type: provider };
   if (platform === "instagram") {
     // Our composer offers Feed | Reel; Postiz calls those "post" and "reel".
     settings.post_type = igFormat === "reel" ? "reel" : "post";
     settings.collaborators = [];
+  }
+  if (platform === "twitter") {
+    settings.who_can_reply_post = X_REPLY_AUDIENCES.includes(options.whoCanReply)
+      ? options.whoCanReply
+      : "everyone";
+    // Optional flags — only sent when actually set, so a plain tweet carries
+    // the smallest payload Postiz will accept.
+    if (options.community) settings.community = options.community;
+    if (options.madeWithAi) settings.made_with_ai = true;
+    if (options.paidPartnership) settings.paid_partnership = true;
   }
   return settings;
 }
@@ -230,7 +259,7 @@ export async function publishPostizPost({ account, post, options = {}, firstComm
         {
           integration: { id: integrationId },
           value: buildValue({ caption: post.body || "", media: uploaded, firstComment }),
-          settings: buildSettings({ provider, platform, igFormat: options.format }),
+          settings: buildSettings({ provider, platform, igFormat: options.format, options }),
         },
       ],
     },

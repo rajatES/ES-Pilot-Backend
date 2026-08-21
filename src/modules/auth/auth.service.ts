@@ -2,7 +2,6 @@ import { Injectable } from "@nestjs/common";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { exchangeForLongLivedToken, fetchLinkedInstagramAccounts, fetchTokenOwner } from "../../lib/facebookOAuth";
 import { exchangeYouTubeCode, getYouTubeChannels } from "../../lib/youtube";
-import { exchangeXCode, fetchXProfile } from "../../lib/x";
 
 const META_API_VERSION = "v23.0";
 const BASE_URL = `https://graph.facebook.com/${META_API_VERSION}`;
@@ -142,32 +141,8 @@ export class AuthService {
   // Threads has no OAuth handler here any more — it connects through Postiz,
   // which owns that token. See modules/postiz for the channel import.
 
-  // X (Twitter) OAuth callback: exchange code (PKCE) → save the profile as a
-  // social account. platform is "twitter" to match the existing UI metadata.
-  async handleXCallback(code: string, codeVerifier: string): Promise<string> {
-    const { accessToken, refreshToken, expiresAt } = await exchangeXCode({ code, codeVerifier });
-    const profile = await fetchXProfile(accessToken);
-
-    const supabase = this.supabaseService.createServiceClient();
-    const { error } = await supabase.from("social_accounts").upsert(
-      {
-        user_id: OWNER_ID,
-        platform: "twitter",
-        account_type: "profile",
-        external_account_id: profile.id,
-        display_name: profile.name,
-        avatar_url: profile.avatar,
-        access_token: accessToken,
-        refresh_token: refreshToken,
-        token_expires_at: expiresAt,
-        metadata: { source: "x_oauth", username: profile.username },
-      },
-      { onConflict: "user_id,platform,external_account_id" },
-    );
-    if (error) throw new Error(error.message);
-
-    return profile.username;
-  }
+  // X has no OAuth handler here any more — it connects through Postiz, which
+  // owns that token. See modules/postiz for the channel import.
 
   // YouTube OAuth callback: exchange code, save channels under OWNER_ID.
   async handleYoutubeCallback(code: string): Promise<number> {

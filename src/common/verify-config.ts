@@ -33,8 +33,6 @@ const OPTIONAL = [
   // Threads and personal/standalone Instagram publish through Postiz, which
   // holds those platform tokens — one workspace key covers every such channel.
   { key: "POSTIZ_API_KEY", feature: "Threads + standalone Instagram publishing (via Postiz)" },
-  { key: "X_CLIENT_ID", feature: "X (Twitter) publishing" },
-  { key: "X_CLIENT_SECRET", feature: "X (Twitter) publishing" },
   { key: "GOOGLE_CLIENT_ID", feature: "YouTube publishing" },
   { key: "GOOGLE_CLIENT_SECRET", feature: "YouTube publishing" },
   { key: "CRON_SECRET", feature: "scheduled publishing + sync crons" },

@@ -5,7 +5,6 @@ import { Public } from "../../auth/public.decorator";
 import { AuthService } from "./auth.service";
 import { buildCanvaAuthUrl, canvaConfigured, exchangeCanvaCode, saveCanvaTokens } from "../../lib/canva";
 import { getYouTubeAuthUrl } from "../../lib/youtube";
-import { buildXAuthUrl, xConfigured } from "../../lib/x";
 
 // After the OAuth dance completes we return the browser to the FRONTEND app,
 // not the backend. The provider redirect_uri (FACEBOOK_/YOUTUBE_/CANVA_REDIRECT_URI)
@@ -107,51 +106,11 @@ export class AuthController {
     }
   }
 
-  // ── X / Twitter (PKCE) ───────────────────────────────────────────────────
-  // OAuth 2.0 user context. The verifier + state live in short-lived cookies
-  // on this backend origin between /start and /callback (same as Canva).
-  @Get("x/start")
-  xStart(@Res() res: Response) {
-    if (!xConfigured()) {
-      return res.redirect(`${frontend()}/app?error=X isn't configured — set X_CLIENT_ID and X_CLIENT_SECRET.`);
-    }
-    const verifier = crypto.randomBytes(48).toString("base64url");
-    const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
-    const state = crypto.randomBytes(16).toString("base64url");
-
-    const cookieOpts = { httpOnly: true as const, sameSite: "lax" as const, path: "/", maxAge: 600_000 };
-    res.cookie("x_verifier", verifier, cookieOpts);
-    res.cookie("x_state", state, cookieOpts);
-    return res.redirect(buildXAuthUrl({ state, codeChallenge: challenge }));
-  }
-
-  @Get("x/callback")
-  async xCallback(
-    @Query("code") code: string,
-    @Query("state") state: string,
-    @Query("error") error: string,
-    @Req() req: Request,
-    @Res() res: Response,
-  ) {
-    const app = `${frontend()}/app`;
-    const savedState = req.cookies?.x_state;
-    const verifier = req.cookies?.x_verifier;
-    res.clearCookie("x_state");
-    res.clearCookie("x_verifier");
-
-    if (error) return res.redirect(`${app}?error=X auth failed: ${error}`);
-    if (!code || !savedState || state !== savedState || !verifier) {
-      return res.redirect(`${app}?error=X auth failed: state mismatch.`);
-    }
-
-    try {
-      const username = await this.auth.handleXCallback(code, verifier);
-      return res.redirect(`${app}?success=Connected X account @${username}`);
-    } catch (err) {
-      console.error("[x callback] error:", err.message);
-      return res.redirect(`${app}?error=X connection failed: ${err.message}`);
-    }
-  }
+  // ── X / Twitter ─────────────────────────────────────────────────────────
+  // No routes: X publishes through Postiz now. The native PKCE pair went away
+  // with lib/x.js — posting on X needs a paid API tier we never bought, so the
+  // native path never published anything. Postiz already holds a working X
+  // authorization; channels are imported from there (modules/postiz).
 
   // ── Canva (per-user, PKCE) ───────────────────────────────────────────────
   // Per-user tokens need to know WHICH teammate. With no session cookie on a

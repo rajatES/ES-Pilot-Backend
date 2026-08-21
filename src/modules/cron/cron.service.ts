@@ -4,11 +4,10 @@ import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { publishFacebookPost, publishFacebookReel, publishFacebookStory, postFacebookComment, checkFacebookPostStatus, getFacebookPostMetrics } from "../../lib/facebook";
 import { publishInstagramPost, postInstagramComment, checkInstagramPostStatus, getInstagramPostMetrics } from "../../lib/instagram";
 import { publishPostizPost, reconcilePostizTarget, getPostizPostMetrics } from "../../lib/postiz";
-import { publishXPost, postXReply, checkXPostStatus, getXPostMetrics } from "../../lib/x";
 import { publishYouTubeVideo, checkYouTubeVideoStatus, getYouTubeVideoAnalytics } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
-import { postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
+import { assertPublishable, postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
 import { buildPostInsightRow } from "../../lib/postInsightRow";
 import { noteAccountPublishFailure, clearAccountPublishFailure } from "../../lib/accountHealth";
 import { ApprovalsService } from "../approvals/approvals.service";
@@ -88,12 +87,13 @@ export class CronService {
       for (const target of queued) {
         const account: any = target.social_accounts;
         try {
+          assertPublishable(account);
           // Per-platform caption override (falls back to the master body).
           const postData = postForPlatform(post, account.platform);
           const result =
-            // Threads / personal Instagram relay through Postiz. Tested first:
-            // the account keeps its real platform value, so it would otherwise
-            // fall into the native Instagram branch. Postiz has no add-comment
+            // Threads / standalone Instagram / X relay through Postiz. Tested
+            // first: the account keeps its real platform value, so it would
+            // otherwise fall into a native branch. Postiz has no add-comment
             // endpoint, so the first comment travels with the post.
             account.publish_via === "postiz"
               ? await publishPostizPost({
@@ -104,15 +104,13 @@ export class CronService {
                 })
               : account.platform === "instagram"
                 ? await publishInstagramPost({ account, post: postData })
-                : account.platform === "twitter"
-                  ? await publishXPost({ account, post: postData })
-                  : account.platform === "youtube"
-                    ? await publishYouTubeVideo({ account, post: postData, options: platformOptions(post, "youtube") } as any)
-                    : fbFormat(post) === "reel"
-                      ? await publishFacebookReel({ account, post: postData })
-                      : fbFormat(post) === "story"
-                        ? await publishFacebookStory({ account, post: postData })
-                        : await publishFacebookPost({ account, post: postData });
+                : account.platform === "youtube"
+                  ? await publishYouTubeVideo({ account, post: postData, options: platformOptions(post, "youtube") } as any)
+                  : fbFormat(post) === "reel"
+                    ? await publishFacebookReel({ account, post: postData })
+                    : fbFormat(post) === "story"
+                      ? await publishFacebookStory({ account, post: postData })
+                      : await publishFacebookPost({ account, post: postData });
 
           await supabase
             .from("post_targets")
@@ -134,9 +132,7 @@ export class CronService {
             try {
               if (account.platform === "instagram") {
                 await postInstagramComment({ account, mediaId: result.externalPostId, message: post.first_comment });
-              } else if (account.platform === "twitter") {
-                await postXReply({ account, tweetId: result.externalPostId, message: post.first_comment });
-              } else if (account.platform !== "youtube") {
+              } else if (account.platform === "facebook") {
                 await postFacebookComment({ account, postId: result.externalPostId, message: post.first_comment });
               }
             } catch (e) {
@@ -268,8 +264,6 @@ export class CronService {
             result = await checkFacebookPostStatus({ account, externalPostId: target.external_post_id });
           } else if (account.platform === "instagram") {
             result = await checkInstagramPostStatus({ account, externalPostId: target.external_post_id });
-          } else if (account.platform === "twitter") {
-            result = await checkXPostStatus({ account, externalPostId: target.external_post_id });
           } else if (account.platform === "youtube") {
             result = await checkYouTubeVideoStatus({ account, videoId: target.external_post_id });
           } else {
@@ -415,8 +409,6 @@ export class CronService {
           m = await getPostizPostMetrics({ externalPostId: target.external_post_id });
         } else if (target.platform === "instagram") {
           m = await getInstagramPostMetrics({ account, externalPostId: target.external_post_id });
-        } else if (target.platform === "twitter") {
-          m = await getXPostMetrics({ account, externalPostId: target.external_post_id });
         } else if (target.platform === "youtube") {
           const yt = await getYouTubeVideoAnalytics({ account, videoId: target.external_post_id });
           m = { likes: yt.likes, comments: yt.comments, shares: 0, impressions: yt.views, reach: null, raw: yt.raw };
