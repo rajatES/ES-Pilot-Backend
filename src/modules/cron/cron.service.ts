@@ -13,6 +13,22 @@ import { noteAccountPublishFailure, clearAccountPublishFailure } from "../../lib
 import { ApprovalsService } from "../approvals/approvals.service";
 import { SocialSyncService } from "../insights/social-sync.service";
 
+// How many due posts one publish run will work through. Raised 25 → 50 on
+// 2026-08-21 at the team's request, now that the queue-starvation fix means the
+// budget is only ever spent on posts that can actually publish.
+//
+// This is NOT the binding constraint for postiz-backed accounts. Postiz caps
+// create-post at roughly 100 calls/hour for the WHOLE workspace, and this cron
+// runs every 5 minutes — so 50 posts/run is already far above what Postiz will
+// accept in an hour. The limit here only bounds how much work one run attempts;
+// see the 429 note in HANDOFF §5 before raising it further.
+const PUBLISH_BATCH_SIZE = 50;
+
+// Cap on the target lookup that decides WHICH posts have publishable work.
+// Purely a runaway guard — a queue of this many unpublished targets is its own
+// incident, not something to page through.
+const READY_TARGET_SCAN = 5000;
+
 @Injectable()
 export class CronService {
   constructor(
@@ -62,18 +78,18 @@ export class CronService {
     // unreviewed posts therefore filled the entire page, and every genuinely-due
     // post newer than them was never fetched — silently, with no error, for as
     // long as the backlog sat there. Asking the targets first makes the limit
-    // below mean "25 posts we can actually publish".
+    // below mean "PUBLISH_BATCH_SIZE posts we can actually publish".
     //
     // No ORDER BY here on purpose: post_targets has no schedule column, so any
     // ordering (created_at included) would imply a priority it doesn't carry —
     // due-ness is decided by scheduled_for in the second query. The cap is only
-    // a runaway guard; a queue of 5000 unpublished targets is its own incident.
+    // a runaway guard (READY_TARGET_SCAN).
     const { data: readyTargets, error: readyError } = await supabase
       .from("post_targets")
       .select("post_id")
       .eq("status", "scheduled")
       .is("external_post_id", null)
-      .limit(5000);
+      .limit(READY_TARGET_SCAN);
     if (readyError) throw new InternalServerErrorException(readyError.message);
 
     const readyPostIds = [...new Set((readyTargets || []).map((t: any) => t.post_id).filter(Boolean))];
@@ -109,7 +125,7 @@ export class CronService {
       .in("status", ["scheduled", "pending_review"])
       .lte("scheduled_for", new Date().toISOString())
       .order("scheduled_for", { ascending: true })
-      .limit(25);
+      .limit(PUBLISH_BATCH_SIZE);
     if (error) throw new InternalServerErrorException(error.message);
 
     let published = 0,
