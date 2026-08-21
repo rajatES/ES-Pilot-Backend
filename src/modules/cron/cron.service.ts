@@ -51,14 +51,61 @@ export class CronService {
     this.authorize(req);
     const supabase = this.supabaseService.createServiceClient();
 
-    // Include pending_review too: with per-page approval, a post can have one
-    // page approved (target "scheduled") while another page still awaits review
-    // (post stays "pending_review"). The approved page must still publish at its
-    // time — we key off the TARGET status below, not the post status.
+    // Which posts actually have work? Ask the TARGETS first.
+    //
+    // This used to select straight from scheduled_posts with `status in
+    // (scheduled, pending_review)`, oldest-first, limit 25 — and that starved
+    // the queue. `pending_review` is included on purpose (per-page approval
+    // means one page can be approved and due while another still awaits
+    // review), but such a post usually has NO publishable target, so it
+    // contributes nothing while still consuming a slot. A backlog of 25+ old
+    // unreviewed posts therefore filled the entire page, and every genuinely-due
+    // post newer than them was never fetched — silently, with no error, for as
+    // long as the backlog sat there. Asking the targets first makes the limit
+    // below mean "25 posts we can actually publish".
+    //
+    // No ORDER BY here on purpose: post_targets has no schedule column, so any
+    // ordering (created_at included) would imply a priority it doesn't carry —
+    // due-ness is decided by scheduled_for in the second query. The cap is only
+    // a runaway guard; a queue of 5000 unpublished targets is its own incident.
+    const { data: readyTargets, error: readyError } = await supabase
+      .from("post_targets")
+      .select("post_id")
+      .eq("status", "scheduled")
+      .is("external_post_id", null)
+      .limit(5000);
+    if (readyError) throw new InternalServerErrorException(readyError.message);
+
+    const readyPostIds = [...new Set((readyTargets || []).map((t: any) => t.post_id).filter(Boolean))];
+    if (!readyPostIds.length) return { due: 0, published: 0, failed: 0 };
+
+    // Recover posts orphaned mid-run. The loop below flips a post to
+    // "publishing" BEFORE working through its targets, and that flip doubles as
+    // the lock stopping the next cron run from touching the same post. If the
+    // process dies in between — a container rebuild, say — the post is stranded:
+    // "publishing" isn't in the status filter below, so it would never be
+    // retried. Two hours is far longer than any real run (every platform call
+    // has its own timeout in the low minutes), so anything still "publishing"
+    // by then is dead and safe to requeue. Scoped to readyPostIds so a post
+    // whose targets all published is left alone rather than being dragged back
+    // to "scheduled" and displaying the wrong status forever.
+    const staleCutoff = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const { data: revived } = await supabase
+      .from("scheduled_posts")
+      .update({ status: "scheduled" })
+      .eq("user_id", OWNER_ID)
+      .eq("status", "publishing")
+      .in("id", readyPostIds)
+      .lt("updated_at", staleCutoff);
+    if (revived?.length) {
+      console.warn(`[cron] requeued ${revived.length} post(s) stranded in "publishing".`);
+    }
+
     const { data: due, error } = await supabase
       .from("scheduled_posts")
       .select("*, post_targets(*, social_accounts(*))")
       .eq("user_id", OWNER_ID)
+      .in("id", readyPostIds)
       .in("status", ["scheduled", "pending_review"])
       .lte("scheduled_for", new Date().toISOString())
       .order("scheduled_for", { ascending: true })
@@ -82,7 +129,15 @@ export class CronService {
       );
       if (!queued.length) continue;
 
-      await supabase.from("scheduled_posts").update({ status: "publishing" }).eq("id", post.id);
+      // Stamp updated_at explicitly: the pg shim issues raw UPDATEs, and
+      // TypeORM's @UpdateDateColumn only fires through the repository API, so
+      // Postgres would leave it at insert time. The stale-recovery above reads
+      // this column to tell a live run from a dead one — without the stamp it
+      // would either never recover anything or recover a run still in flight.
+      await supabase
+        .from("scheduled_posts")
+        .update({ status: "publishing", updated_at: new Date().toISOString() })
+        .eq("id", post.id);
 
       for (const target of queued) {
         const account: any = target.social_accounts;
