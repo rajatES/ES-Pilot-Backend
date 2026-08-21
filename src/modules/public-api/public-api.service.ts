@@ -238,7 +238,7 @@ export class PublicApiService {
     const { data, error } = await db
       .from("social_accounts")
       .select(
-        "id, platform, display_name, external_account_id, publishing_ok, token_expires_at, category, metadata, created_at",
+        "id, platform, display_name, external_account_id, publish_via, publishing_ok, token_expires_at, category, metadata, created_at",
       )
       .eq("user_id", OWNER_ID)
       .order("created_at", { ascending: false });
@@ -279,6 +279,13 @@ export class PublicApiService {
         externalAccountId: a.external_account_id,
         status: a.publishing_ok === false || expired ? "blocked" : "active",
         publishingOk: a.publishing_ok !== false,
+        // Which pipeline publishes here: "native" (our own platform app) or
+        // "postiz" (relayed through the Postiz workspace — Threads, personal
+        // Instagram). Additive field; callers that ignore it are unaffected.
+        // Worth exposing because postiz channels share ONE upstream rate limit
+        // (~100 creates/hour across the whole workspace), so an automation
+        // fanning out wide may want to pace them differently.
+        publishVia: a.publish_via || "native",
         tokenExpiresAt: a.token_expires_at || null,
         category: a.category,
         // Caller-owned correlation id. Read from the automation config first —

@@ -30,8 +30,9 @@ const REQUIRED: { key: string; url?: boolean; alt?: string }[] = [
 const OPTIONAL = [
   { key: "FACEBOOK_CLIENT_ID", feature: "Facebook/Instagram publishing" },
   { key: "FACEBOOK_CLIENT_SECRET", feature: "Facebook/Instagram publishing" },
-  { key: "THREADS_APP_ID", feature: "Threads publishing" },
-  { key: "THREADS_APP_SECRET", feature: "Threads publishing" },
+  // Threads and personal/standalone Instagram publish through Postiz, which
+  // holds those platform tokens — one workspace key covers every such channel.
+  { key: "POSTIZ_API_KEY", feature: "Threads + personal Instagram publishing (via Postiz)" },
   { key: "X_CLIENT_ID", feature: "X (Twitter) publishing" },
   { key: "X_CLIENT_SECRET", feature: "X (Twitter) publishing" },
   { key: "GOOGLE_CLIENT_ID", feature: "YouTube publishing" },

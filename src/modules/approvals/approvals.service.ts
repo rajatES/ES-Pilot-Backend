@@ -9,7 +9,7 @@ import {
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { publishFacebookPost, publishFacebookReel, publishFacebookStory, postFacebookComment } from "../../lib/facebook";
 import { publishInstagramPost, postInstagramComment } from "../../lib/instagram";
-import { publishThreadsPost, postThreadsReply } from "../../lib/threads";
+import { publishPostizPost } from "../../lib/postiz";
 import { publishXPost, postXReply } from "../../lib/x";
 import { publishYouTubeVideo } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
@@ -276,17 +276,26 @@ export class ApprovalsService {
           continue;
         }
 
-        if (account.platform === "youtube") {
+        if (account.publish_via === "postiz") {
+          // Threads / personal Instagram, relayed through Postiz. Tested before
+          // the platform branches because the account keeps its real platform
+          // value. Postiz has no add-comment endpoint, so the first comment goes
+          // out with the post and the block below skips its own.
+          result = await publishPostizPost({
+            account,
+            post: postData,
+            options: platformOptions(post, account.platform),
+            firstComment: post.first_comment || "",
+          });
+          targetStatus = "sent";
+          sentAt = new Date().toISOString();
+        } else if (account.platform === "youtube") {
           // Uploads now; future posts use YouTube's native publishAt.
           result = await publishYouTubeVideo({ account, post: postData, scheduledFor: publishNow ? null : post.scheduled_for, options: platformOptions(post, "youtube") });
           targetStatus = publishNow ? "sent" : "scheduled";
           if (publishNow) sentAt = new Date().toISOString();
         } else if (account.platform === "instagram") {
           result = await publishInstagramPost({ account, post: postData });
-          targetStatus = "sent";
-          sentAt = new Date().toISOString();
-        } else if (account.platform === "threads") {
-          result = await publishThreadsPost({ account, post: postData });
           targetStatus = "sent";
           sentAt = new Date().toISOString();
         } else if (account.platform === "twitter") {
@@ -312,14 +321,13 @@ export class ApprovalsService {
           .update({ status: targetStatus, external_post_id: result.externalPostId, sent_at: sentAt, ...review() })
           .eq("id", target.id);
 
-        // Stories have no comments — skip the first comment for them.
+        // Stories have no comments — skip the first comment for them. Postiz
+        // already submitted it with the post, so skip those too.
         const isStory = account.platform === "facebook" && fbFormat(post) === "story";
-        if (targetStatus === "sent" && !isStory && post.first_comment?.trim() && result.externalPostId) {
+        if (targetStatus === "sent" && !isStory && !result.firstCommentIncluded && post.first_comment?.trim() && result.externalPostId) {
           try {
             if (account.platform === "instagram") {
               await postInstagramComment({ account, mediaId: result.externalPostId, message: post.first_comment });
-            } else if (account.platform === "threads") {
-              await postThreadsReply({ account, mediaId: result.externalPostId, message: post.first_comment });
             } else if (account.platform === "twitter") {
               await postXReply({ account, tweetId: result.externalPostId, message: post.first_comment });
             } else if (account.platform !== "youtube") {

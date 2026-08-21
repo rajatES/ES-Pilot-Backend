@@ -1,6 +1,6 @@
 // Single source of truth for a `post_insights` row built from a platform
 // metrics object (the shape returned by getFacebookPostMetrics /
-// getInstagramPostMetrics / getThreadsPostMetrics / getXPostMetrics / the
+// getInstagramPostMetrics / getPostizPostMetrics / getXPostMetrics / the
 // YouTube adapter).
 //
 // Both writers — the periodic insights cron and the manual refresh — MUST build

@@ -29,6 +29,7 @@ import { ComplianceModule } from "./modules/compliance/compliance.module";
 import { UploadModule } from "./modules/upload/upload.module";
 import { CanvaModule } from "./modules/canva/canva.module";
 import { SocialModule } from "./modules/social/social.module";
+import { PostizModule } from "./modules/postiz/postiz.module";
 import { AuthModule } from "./modules/auth/auth.module";
 import { CronModule } from "./modules/cron/cron.module";
 import { QueuesModule } from "./modules/queues/queues.module";
@@ -72,6 +73,8 @@ import { PublicApiModule } from "./modules/public-api/public-api.module";
     UploadModule,
     CanvaModule,
     SocialModule,
+    // Threads + personal/standalone Instagram, published through Postiz.
+    PostizModule,
     AuthModule,
     CronModule,
     QueuesModule,

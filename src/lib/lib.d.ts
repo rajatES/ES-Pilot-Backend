@@ -15,7 +15,7 @@ declare module "*/lib/sportsEntities";
 declare module "*/lib/facebookOAuth";
 declare module "*/lib/postContent";
 declare module "*/lib/postFields";
-declare module "*/lib/threads";
+declare module "*/lib/postiz";
 declare module "*/lib/x";
 declare module "*/lib/metaError";
 declare module "*/lib/accountHealth";

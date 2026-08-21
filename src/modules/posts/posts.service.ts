@@ -18,7 +18,7 @@ import {
   publishUnpublishedFacebookPost,
 } from "../../lib/facebook";
 import { publishInstagramPost, postInstagramComment, checkInstagramPostStatus } from "../../lib/instagram";
-import { publishThreadsPost, postThreadsReply, checkThreadsPostStatus } from "../../lib/threads";
+import { publishPostizPost, reconcilePostizTarget } from "../../lib/postiz";
 import { publishXPost, postXReply, checkXPostStatus } from "../../lib/x";
 import { publishYouTubeVideo, checkYouTubeVideoStatus, updateScheduledYouTubeVideo } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
@@ -341,7 +341,21 @@ export class PostsService {
           continue;
         }
 
-        if (account.platform === "youtube") {
+        if (account.publish_via === "postiz") {
+          // Threads / personal Instagram, relayed through Postiz. Checked before
+          // the platform branches because such an account still carries its real
+          // platform ("threads"/"instagram") and must not reach the native libs.
+          // Postiz has no add-comment endpoint, so the first comment travels
+          // with the post and firstCommentIncluded tells the block below to skip.
+          result = await publishPostizPost({
+            account,
+            post: postData,
+            options: platformOptions(post, account.platform),
+            firstComment: resolvedFirstComment,
+          });
+          targetStatus = "sent";
+          sentAt = new Date().toISOString();
+        } else if (account.platform === "youtube") {
           // Real end-to-end upload. For future posts YouTube's NATIVE
           // scheduling is used: the video uploads now as private with
           // status.publishAt and goes public at the scheduled time.
@@ -359,10 +373,6 @@ export class PostsService {
           sentAt = new Date().toISOString();
         } else if (account.platform === "instagram") {
           result = await publishInstagramPost({ account, post: postData });
-          targetStatus = "sent";
-          sentAt = new Date().toISOString();
-        } else if (account.platform === "threads") {
-          result = await publishThreadsPost({ account, post: postData });
           targetStatus = "sent";
           sentAt = new Date().toISOString();
         } else {
@@ -389,13 +399,13 @@ export class PostsService {
         // (immediate publish). A native-scheduler post can't get one from here
         // since this route isn't invoked again when Facebook publishes it later.
         // Stories have no comments — skip them.
+        // Postiz already submitted the comment as part of the post (it has no
+        // add-comment endpoint), so don't post a second one.
         const isStory = account.platform === "facebook" && fbFormat(post) === "story";
-        if (targetStatus === "sent" && !isStory && resolvedFirstComment && result.externalPostId) {
+        if (targetStatus === "sent" && !isStory && !result.firstCommentIncluded && resolvedFirstComment && result.externalPostId) {
           try {
             if (account.platform === "instagram") {
               await postInstagramComment({ account, mediaId: result.externalPostId, message: resolvedFirstComment });
-            } else if (account.platform === "threads") {
-              await postThreadsReply({ account, mediaId: result.externalPostId, message: resolvedFirstComment });
             } else if (account.platform === "twitter") {
               await postXReply({ account, tweetId: result.externalPostId, message: resolvedFirstComment });
             } else if (account.platform !== "youtube") {
@@ -844,7 +854,7 @@ export class PostsService {
     const { data: posts, error } = await supabase
       .from("scheduled_posts")
       .select(
-        "id, body, first_comment, status, sent_at, scheduled_for, post_targets(id, status, external_post_id, social_accounts(id, display_name, access_token, platform, external_account_id))",
+        "id, body, first_comment, status, sent_at, scheduled_for, post_targets(id, status, external_post_id, sent_at, permalink, social_accounts(id, display_name, access_token, platform, publish_via, external_account_id, metadata))",
       )
       .eq("user_id", OWNER_ID)
       .in("status", ["sent", "scheduled", "publishing"])
@@ -876,6 +886,16 @@ export class PostsService {
           continue;
         }
 
+        // Postiz-backed targets (Threads / personal Instagram) reconcile against
+        // Postiz instead: it reports a publish error and hands back a permalink,
+        // but gives no trustworthy signal that a post was removed on the
+        // platform, so they stay exempt from deletion sync.
+        if (account.publish_via === "postiz") {
+          await reconcilePostizTarget(target);
+          targetStatuses.push(target.status);
+          continue;
+        }
+
         checked++;
         let result;
         try {
@@ -886,12 +906,15 @@ export class PostsService {
             // that drives the scheduled → sent transition below.
             result = await checkYouTubeVideoStatus({ account, videoId: target.external_post_id });
           } else if (account.platform === "instagram") {
-            // IG/Threads/X posts are always live once sent — only existence matters.
+            // IG/X posts are always live once sent — only existence matters.
             result = { ...(await checkInstagramPostStatus({ account, externalPostId: target.external_post_id })), isPublished: true };
           } else if (account.platform === "twitter") {
             result = { ...(await checkXPostStatus({ account, externalPostId: target.external_post_id })), isPublished: true };
           } else {
-            result = { ...(await checkThreadsPostStatus({ account, externalPostId: target.external_post_id })), isPublished: true };
+            // Native Threads publishing was retired in favour of Postiz, which
+            // the branch above handles — nothing else should reach here, and
+            // exists:null leaves the target untouched if anything does.
+            result = { exists: null };
           }
         } catch {
           result = { exists: null };

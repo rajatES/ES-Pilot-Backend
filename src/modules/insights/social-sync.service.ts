@@ -85,10 +85,18 @@ export class SocialSyncService {
     const db = this.supabaseService.createServiceClient();
     const { since, until } = this.window(body);
 
+    // Native Meta accounts only. This sync walks the Graph page/media edge to
+    // pull ORGANIC posts too, which needs a token we hold — and Postiz exposes
+    // no equivalent "everything on this channel" endpoint, only the posts it
+    // published itself. So postiz-backed channels (Threads, personal Instagram)
+    // contribute app-made posts to Post Analytics via post_insights, but never
+    // organic ones. Excluded here rather than left to return an empty list, so
+    // the per-account report doesn't imply they were checked.
     const { data: accounts } = await db
       .from("social_accounts")
       .select("*")
       .eq("user_id", OWNER_ID)
+      .neq("publish_via", "postiz")
       .in("platform", ["facebook", "instagram"]);
 
     let listed = 0, synced = 0, failed = 0;

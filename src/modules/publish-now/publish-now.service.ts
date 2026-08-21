@@ -2,7 +2,7 @@ import { BadRequestException, Injectable, InternalServerErrorException, NotFound
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { publishFacebookPost, publishFacebookReel, publishFacebookStory, postFacebookComment } from "../../lib/facebook";
 import { publishInstagramPost, postInstagramComment } from "../../lib/instagram";
-import { publishThreadsPost, postThreadsReply } from "../../lib/threads";
+import { publishPostizPost } from "../../lib/postiz";
 import { publishXPost, postXReply } from "../../lib/x";
 import { publishYouTubeVideo } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
@@ -145,10 +145,19 @@ export class PublishNowService {
           link_url: outboundLink,
         };
         const publishResult =
-          account.platform === "instagram"
-            ? await publishInstagramPost({ account, post: postData })
-            : account.platform === "threads"
-              ? await publishThreadsPost({ account, post: postData })
+          // Threads / personal Instagram go through Postiz. Tested first: such an
+          // account keeps its real platform value, so it would otherwise fall
+          // into the native Instagram branch. Postiz has no add-comment
+          // endpoint, so the first comment travels with the post.
+          account.publish_via === "postiz"
+            ? await publishPostizPost({
+                account,
+                post: postData,
+                options: platformOptions(post, account.platform),
+                firstComment: resolvedFirstComment,
+              })
+            : account.platform === "instagram"
+              ? await publishInstagramPost({ account, post: postData })
               : account.platform === "twitter"
                 ? await publishXPost({ account, post: postData })
                 : account.platform === "youtube"
@@ -168,14 +177,13 @@ export class PublishNowService {
           .eq("social_account_id", account.id);
 
         // Best-effort first comment — never fails the publish itself.
-        // (Stories have no comments — skip them.)
+        // (Stories have no comments — skip them. Postiz already submitted the
+        // comment with the post, so don't post a second one.)
         const isStory = account.platform === "facebook" && fbFormat(post) === "story";
-        if (!isStory && resolvedFirstComment && publishResult.externalPostId) {
+        if (!isStory && !publishResult.firstCommentIncluded && resolvedFirstComment && publishResult.externalPostId) {
           try {
             if (account.platform === "instagram") {
               await postInstagramComment({ account, mediaId: publishResult.externalPostId, message: resolvedFirstComment });
-            } else if (account.platform === "threads") {
-              await postThreadsReply({ account, mediaId: publishResult.externalPostId, message: resolvedFirstComment });
             } else if (account.platform === "twitter") {
               await postXReply({ account, tweetId: publishResult.externalPostId, message: resolvedFirstComment });
             } else if (account.platform !== "youtube") {

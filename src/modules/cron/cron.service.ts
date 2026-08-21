@@ -3,7 +3,7 @@ import { createHash } from "crypto";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { publishFacebookPost, publishFacebookReel, publishFacebookStory, postFacebookComment, checkFacebookPostStatus, getFacebookPostMetrics } from "../../lib/facebook";
 import { publishInstagramPost, postInstagramComment, checkInstagramPostStatus, getInstagramPostMetrics } from "../../lib/instagram";
-import { publishThreadsPost, postThreadsReply, checkThreadsPostStatus, refreshThreadsToken, getThreadsPostMetrics } from "../../lib/threads";
+import { publishPostizPost, reconcilePostizTarget, getPostizPostMetrics } from "../../lib/postiz";
 import { publishXPost, postXReply, checkXPostStatus, getXPostMetrics } from "../../lib/x";
 import { publishYouTubeVideo, checkYouTubeVideoStatus, getYouTubeVideoAnalytics } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
@@ -91,10 +91,19 @@ export class CronService {
           // Per-platform caption override (falls back to the master body).
           const postData = postForPlatform(post, account.platform);
           const result =
-            account.platform === "instagram"
-              ? await publishInstagramPost({ account, post: postData })
-              : account.platform === "threads"
-                ? await publishThreadsPost({ account, post: postData })
+            // Threads / personal Instagram relay through Postiz. Tested first:
+            // the account keeps its real platform value, so it would otherwise
+            // fall into the native Instagram branch. Postiz has no add-comment
+            // endpoint, so the first comment travels with the post.
+            account.publish_via === "postiz"
+              ? await publishPostizPost({
+                  account,
+                  post: postData,
+                  options: platformOptions(post, account.platform),
+                  firstComment: post.first_comment || "",
+                })
+              : account.platform === "instagram"
+                ? await publishInstagramPost({ account, post: postData })
                 : account.platform === "twitter"
                   ? await publishXPost({ account, post: postData })
                   : account.platform === "youtube"
@@ -118,14 +127,13 @@ export class CronService {
           // A publish proves the token still works — lift any earlier flag.
           await clearAccountPublishFailure(account);
 
-          // Stories have no comments — skip the first comment for them.
+          // Stories have no comments — skip the first comment for them. Postiz
+          // already submitted it with the post, so skip those too.
           const isStory = account.platform === "facebook" && fbFormat(post) === "story";
-          if (!isStory && post.first_comment?.trim() && result.externalPostId) {
+          if (!isStory && !result.firstCommentIncluded && post.first_comment?.trim() && result.externalPostId) {
             try {
               if (account.platform === "instagram") {
                 await postInstagramComment({ account, mediaId: result.externalPostId, message: post.first_comment });
-              } else if (account.platform === "threads") {
-                await postThreadsReply({ account, mediaId: result.externalPostId, message: post.first_comment });
               } else if (account.platform === "twitter") {
                 await postXReply({ account, tweetId: result.externalPostId, message: post.first_comment });
               } else if (account.platform !== "youtube") {
@@ -241,6 +249,18 @@ export class CronService {
           }
         }
 
+        // Postiz-backed targets (Threads / personal Instagram) reconcile against
+        // Postiz instead: it reports a publish error and hands back a permalink,
+        // but has no trustworthy signal that a post was removed on the platform.
+        // Marking them deleted off a missing Postiz record would invent
+        // deletions, so they stay exempt from deletion sync.
+        if (account.publish_via === "postiz") {
+          checked++;
+          await reconcilePostizTarget(target);
+          targetStatuses.push(target.status);
+          continue;
+        }
+
         checked++;
         let result;
         try {
@@ -248,8 +268,6 @@ export class CronService {
             result = await checkFacebookPostStatus({ account, externalPostId: target.external_post_id });
           } else if (account.platform === "instagram") {
             result = await checkInstagramPostStatus({ account, externalPostId: target.external_post_id });
-          } else if (account.platform === "threads") {
-            result = await checkThreadsPostStatus({ account, externalPostId: target.external_post_id });
           } else if (account.platform === "twitter") {
             result = await checkXPostStatus({ account, externalPostId: target.external_post_id });
           } else if (account.platform === "youtube") {
@@ -365,32 +383,14 @@ export class CronService {
     const supabase = this.supabaseService.createServiceClient();
     const since = new Date(Date.now() - 30 * 86400000).toISOString();
 
-    // ── Threads token upkeep: long-lived tokens last ~60 days and must be
-    // refreshed before expiry. This cron runs every few hours — refresh any
-    // Threads account entering its final week.
-    const refreshCutoff = new Date(Date.now() + 7 * 86400000).toISOString();
-    const { data: threadsAccounts } = await supabase
-      .from("social_accounts")
-      .select("id, access_token, token_expires_at")
-      .eq("user_id", OWNER_ID)
-      .eq("platform", "threads")
-      .lt("token_expires_at", refreshCutoff);
-    for (const acct of threadsAccounts || []) {
-      try {
-        const { accessToken, expiresAt } = await refreshThreadsToken(acct.access_token);
-        await supabase
-          .from("social_accounts")
-          .update({ access_token: accessToken, token_expires_at: expiresAt })
-          .eq("id", acct.id);
-      } catch (e) {
-        console.warn(`[insights] Threads token refresh failed for account ${acct.id}:`, e.message);
-      }
-    }
-
+    // No Threads token upkeep here any more: Threads publishes through Postiz,
+    // which holds and refreshes that token itself. The block that used to
+    // refresh expiring long-lived Threads tokens went away with the native
+    // Threads path.
     const { data: targets, error } = await supabase
       .from("post_targets")
       .select(
-        "id, external_post_id, platform, sent_at, social_accounts(id, display_name, access_token, platform, external_account_id)",
+        "id, external_post_id, platform, sent_at, social_accounts(id, display_name, access_token, platform, publish_via, external_account_id, metadata)",
       )
       .eq("status", "sent")
       .in("platform", ["facebook", "instagram", "threads", "twitter", "youtube"])
@@ -408,10 +408,13 @@ export class CronService {
       try {
         const account: any = target.social_accounts;
         let m;
-        if (target.platform === "instagram") {
+        if (account.publish_via === "postiz") {
+          // Postiz reports analytics per ITS post id, not the platform's, and
+          // the same call serves Threads and Instagram — so route on how the
+          // account publishes rather than on the platform.
+          m = await getPostizPostMetrics({ externalPostId: target.external_post_id });
+        } else if (target.platform === "instagram") {
           m = await getInstagramPostMetrics({ account, externalPostId: target.external_post_id });
-        } else if (target.platform === "threads") {
-          m = await getThreadsPostMetrics({ account, externalPostId: target.external_post_id });
         } else if (target.platform === "twitter") {
           m = await getXPostMetrics({ account, externalPostId: target.external_post_id });
         } else if (target.platform === "youtube") {

@@ -5,7 +5,7 @@ import { getFacebookPostMetrics } from "../../lib/facebook";
 // @ts-ignore
 import { getInstagramPostMetrics } from "../../lib/instagram";
 // @ts-ignore
-import { getThreadsPostMetrics } from "../../lib/threads";
+import { getPostizPostMetrics } from "../../lib/postiz";
 // @ts-ignore
 import { getXPostMetrics } from "../../lib/x";
 // @ts-ignore
@@ -131,7 +131,7 @@ export class InsightsService {
     let q = supabase
       .from("scheduled_posts")
       .select(
-        "id, body, image_url, media, link_url, content_type, platform_options, sent_at, scheduled_for, status, source, created_by, post_targets(id, platform, status, external_post_id, sent_at, social_accounts(id, display_name, platform, category, avatar_url))",
+        "id, body, image_url, media, link_url, content_type, platform_options, sent_at, scheduled_for, status, source, created_by, post_targets(id, platform, status, external_post_id, permalink, sent_at, social_accounts(id, display_name, platform, category, avatar_url))",
       )
       .eq("user_id", OWNER_ID)
       .in("status", ["sent", "deleted"])
@@ -185,6 +185,9 @@ export class InsightsService {
           title: p.body || "",
           thumbnailUrl: p.image_url || null,
           externalPostId: t.external_post_id,
+          // Set for postiz-backed targets, whose ids map to no public URL —
+          // the table's View link falls back to id-derived URLs without it.
+          permalink: t.permalink || null,
           contentType: p.content_type || null,
           postType,
           platformOptions: p.platform_options || null,
@@ -258,6 +261,10 @@ export class InsightsService {
             title: sp.message || "",
             thumbnailUrl: sp.thumbnail_url || sp.media_url || null,
             externalPostId: sp.external_post_id,
+            // social_posts has carried a real permalink from the Graph sync all
+            // along; it just was never handed to the table, so organic
+            // Instagram rows showed no View link despite having a URL.
+            permalink: sp.permalink || null,
             contentType: null,
             postType: sp.post_type || "status",
             platformOptions: null,
@@ -335,7 +342,7 @@ export class InsightsService {
     let q = supabase
       .from("post_targets")
       .select(
-        "id, external_post_id, platform, sent_at, post_id, social_accounts(id, display_name, access_token, platform, external_account_id)",
+        "id, external_post_id, platform, sent_at, post_id, social_accounts(id, display_name, access_token, platform, publish_via, external_account_id, metadata)",
       )
       .eq("status", "sent")
       .in("platform", ["facebook", "instagram", "threads", "twitter", "youtube"])
@@ -368,8 +375,11 @@ export class InsightsService {
   }
 
   private async fetchMetrics(platform: string, account: any, externalPostId: string): Promise<any> {
+    // Postiz reports analytics per ITS post id, not the platform's, and one call
+    // serves both Threads and Instagram — so route on how the account publishes
+    // before looking at the platform at all.
+    if (account?.publish_via === "postiz") return getPostizPostMetrics({ externalPostId });
     if (platform === "instagram") return getInstagramPostMetrics({ account, externalPostId });
-    if (platform === "threads") return getThreadsPostMetrics({ account, externalPostId });
     if (platform === "twitter") return getXPostMetrics({ account, externalPostId });
     if (platform === "youtube") {
       const yt = await getYouTubeVideoAnalytics({ account, videoId: externalPostId });

@@ -149,6 +149,16 @@ export class AccountsService {
       try {
         let followers = null,
           likes = null;
+        // Postiz-backed channels hold no token of ours, and a Postiz-backed
+        // Instagram row still has platform "instagram" — so without this it
+        // would fall into the Graph probe below with access_token=null, fail,
+        // and get stamped "can't publish" on every sync. Postiz owns their
+        // token health; leave it alone. (Checked before platform for exactly
+        // that reason.)
+        if (a.publish_via === "postiz") {
+          results.push({ id: a.id, ok: true, skipped: true });
+          continue;
+        }
         if (a.platform === "instagram") {
           const r = await fetch(
             `${GRAPH}/${a.external_account_id}?fields=followers_count,media_count,username&access_token=${a.access_token}`,

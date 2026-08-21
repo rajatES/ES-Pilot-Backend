@@ -5,7 +5,6 @@ import { Public } from "../../auth/public.decorator";
 import { AuthService } from "./auth.service";
 import { buildCanvaAuthUrl, canvaConfigured, exchangeCanvaCode, saveCanvaTokens } from "../../lib/canva";
 import { getYouTubeAuthUrl } from "../../lib/youtube";
-import { buildThreadsAuthUrl, threadsConfigured } from "../../lib/threads";
 import { buildXAuthUrl, xConfigured } from "../../lib/x";
 
 // After the OAuth dance completes we return the browser to the FRONTEND app,
@@ -80,47 +79,12 @@ export class AuthController {
   }
 
   // ── Threads ──────────────────────────────────────────────────────────────
-  // Threads has its OWN OAuth (threads.net) and app credentials — the FB page
-  // token cannot post to Threads. Each Threads profile authorizes individually;
-  // the callback saves it as a social_accounts row (platform "threads").
-  @Get("threads/start")
-  threadsStart(@Res() res: Response) {
-    if (!threadsConfigured()) {
-      return res.redirect(
-        `${frontend()}/app?error=Threads isn't configured — set THREADS_APP_ID and THREADS_APP_SECRET.`,
-      );
-    }
-    const state = crypto.randomBytes(16).toString("base64url");
-    const cookieOpts = { httpOnly: true as const, sameSite: "lax" as const, path: "/", maxAge: 600_000 };
-    res.cookie("threads_state", state, cookieOpts);
-    return res.redirect(buildThreadsAuthUrl({ state }));
-  }
-
-  @Get("threads/callback")
-  async threadsCallback(
-    @Query("code") code: string,
-    @Query("state") state: string,
-    @Query("error") error: string,
-    @Query("error_description") errorDescription: string,
-    @Req() req: Request,
-    @Res() res: Response,
-  ) {
-    const app = `${frontend()}/app`;
-    const savedState = req.cookies?.threads_state;
-    res.clearCookie("threads_state");
-
-    if (error) return res.redirect(`${app}?error=Threads auth failed: ${errorDescription || error}`);
-    if (!code) return res.redirect(`${app}?error=No authorization code received from Threads.`);
-    if (!savedState || state !== savedState) return res.redirect(`${app}?error=Threads auth failed: state mismatch.`);
-
-    try {
-      const username = await this.auth.handleThreadsCallback(code);
-      return res.redirect(`${app}?success=Connected Threads profile @${username}`);
-    } catch (err) {
-      console.error("[threads callback] error:", err.message);
-      return res.redirect(`${app}?error=Threads connection failed: ${err.message}`);
-    }
-  }
+  // No routes: Threads is connected through Postiz, not our own OAuth. Meta's
+  // Threads API needs a separate app plus review, which we never completed, so
+  // the native start/callback pair (and lib/threads.js behind it) was retired.
+  // Channels are imported from the Postiz workspace instead — see
+  // modules/postiz. Nothing here should be re-added without also restoring a
+  // native publish path; `publish_via` is what decides which one runs.
 
   // ── YouTube ──────────────────────────────────────────────────────────────
   @Get("youtube/start")

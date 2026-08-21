@@ -2,7 +2,6 @@ import { Injectable } from "@nestjs/common";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { exchangeForLongLivedToken, fetchLinkedInstagramAccounts, fetchTokenOwner } from "../../lib/facebookOAuth";
 import { exchangeYouTubeCode, getYouTubeChannels } from "../../lib/youtube";
-import { exchangeThreadsCode, exchangeForLongLivedThreadsToken, fetchThreadsProfile } from "../../lib/threads";
 import { exchangeXCode, fetchXProfile } from "../../lib/x";
 
 const META_API_VERSION = "v23.0";
@@ -140,32 +139,8 @@ export class AuthService {
     return savedCount;
   }
 
-  // Threads OAuth callback: exchange code → long-lived token → save the
-  // profile as a social account. Returns the connected profile's username.
-  async handleThreadsCallback(code: string): Promise<string> {
-    const { accessToken: shortToken } = await exchangeThreadsCode(code);
-    const { accessToken, expiresAt } = await exchangeForLongLivedThreadsToken(shortToken);
-    const profile = await fetchThreadsProfile(accessToken);
-
-    const supabase = this.supabaseService.createServiceClient();
-    const { error } = await supabase.from("social_accounts").upsert(
-      {
-        user_id: OWNER_ID,
-        platform: "threads",
-        account_type: "profile",
-        external_account_id: profile.id,
-        display_name: profile.name,
-        avatar_url: profile.avatar,
-        access_token: accessToken,
-        token_expires_at: expiresAt,
-        metadata: { source: "threads_oauth", username: profile.username },
-      },
-      { onConflict: "user_id,platform,external_account_id" },
-    );
-    if (error) throw new Error(error.message);
-
-    return profile.username;
-  }
+  // Threads has no OAuth handler here any more — it connects through Postiz,
+  // which owns that token. See modules/postiz for the channel import.
 
   // X (Twitter) OAuth callback: exchange code (PKCE) → save the profile as a
   // social account. platform is "twitter" to match the existing UI metadata.

@@ -158,6 +158,16 @@ export class SocialAccount {
   @Column()
   platform: string; // facebook | instagram | threads | twitter | youtube
 
+  // Which pipeline publishes to this account. "native" = our own Meta/X/Google
+  // app + the token on this row. "postiz" = relayed through the Postiz API with
+  // the workspace POSTIZ_API_KEY, for channels our apps can't reach (Threads,
+  // personal/standalone Instagram) — there `external_account_id` is the Postiz
+  // integration id, `access_token` stays null, and the Postiz provider
+  // identifier lives in metadata.postiz.provider. `platform` is unaffected, so
+  // the composer/previews/analytics treat these like any other account.
+  @Column({ name: "publish_via", default: "native" })
+  publish_via: string; // native | postiz
+
   @Column({ name: "account_type", default: "page" })
   account_type: string;
 
@@ -357,6 +367,14 @@ export class PostTarget {
 
   @Column({ name: "deleted_at", type: "timestamptz", nullable: true })
   deleted_at: Date | null;
+
+  // Public URL of the published post, when the platform gives us one. Native
+  // Facebook/X/YouTube permalinks are derived from the id (frontend fbLink.js),
+  // but Instagram and Threads media ids have no derivable URL — Postiz returns
+  // one as `releaseURL`, so postiz-backed targets store it here and the View
+  // button finally works for them.
+  @Column({ type: "text", nullable: true })
+  permalink: string | null;
 
   // sha1 of the last remote caption we saw — lets the sync cron detect an
   // externally-edited post exactly once.
