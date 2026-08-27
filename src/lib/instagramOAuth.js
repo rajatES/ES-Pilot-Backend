@@ -122,6 +122,16 @@ export async function exchangeInstagramCode(code) {
     console.error(`[instagram login] code exchange failed (HTTP ${res.status}): ${String(raw).slice(0, 500)}`);
     throw new Error(oauthErrorMessage(data, "Instagram rejected the authorization code."));
   }
+
+  // Log the SHAPE, never the token. Whether this response carries an
+  // `expires_in` is exactly what decides if the token is already long-lived —
+  // the docs call it short-lived, but ig_exchange_token rejects it as though it
+  // isn't (see exchangeForLongLivedInstagramToken). This line is how we find out
+  // without guessing.
+  console.log(
+    `[instagram login] code exchange ok — fields: [${Object.keys(data).join(", ")}]` +
+      (data.expires_in !== undefined ? `, expires_in=${data.expires_in}s (~${Math.round(Number(data.expires_in) / 86400)}d)` : ", no expires_in"),
+  );
   return {
     accessToken: data.access_token,
     // The Instagram-scoped user id. Kept as a fallback for the profile lookup,
@@ -174,31 +184,44 @@ export async function exchangeForLongLivedInstagramToken(shortLivedToken) {
     return { ok: res.ok, status: res.status, data, raw };
   };
 
-  let out = await attempt("GET");
-
-  const methodRejected = (o) =>
-    /unsupported\s+(request|get|post)|method type/i.test(
-      o.data?.error?.message || o.data?.error_message || o.raw || "",
-    );
-
-  if ((!out.ok || !out.data?.access_token) && methodRejected(out)) {
-    console.warn(
-      `[instagram login] long-lived exchange rejected GET (${out.status}: ${String(out.raw).slice(0, 200)}) — retrying as POST.`,
-    );
-    out = await attempt("POST");
+  const out = await attempt("GET");
+  if (out.ok && out.data?.access_token) {
+    return { accessToken: out.data.access_token, expiresIn: Number(out.data.expires_in) || null, grant: "ig_exchange_token" };
   }
 
-  if (!out.ok || !out.data?.access_token) {
-    // Log the raw body: Meta's message alone has repeatedly been too vague to
-    // act on here, and this call happens once during an interactive connect —
-    // there is no second chance to capture it.
+  // Both GET and POST come back `IGApiException` "Unsupported request - method
+  // type: <method>" on a REAL token (observed live 2026-08-27, fbtrace
+  // A59HM2lzQjZRzqUiYhzRs_S). That is not a method problem: the same endpoint
+  // answers a deliberately invalid token with `OAuthException` "Failed to
+  // decode" instead, which means Meta only reaches "unsupported" AFTER it has
+  // successfully decoded the token and seen what kind it is. So the grant does
+  // not apply to this token — the Business Login code exchange has evidently
+  // already returned a long-lived token, making short→long meaningless.
+  //
+  // `ig_refresh_token` is the grant for a token that is ALREADY long-lived, so
+  // try that: between them the two grants cover both possible states, and we
+  // still try the documented one first.
+  console.warn(
+    `[instagram login] ig_exchange_token rejected (${out.status}: ${String(out.raw).slice(0, 200)}) — ` +
+      `token is likely already long-lived; trying ig_refresh_token.`,
+  );
+
+  try {
+    const refreshed = await refreshInstagramToken(shortLivedToken);
+    console.log("[instagram login] ig_refresh_token succeeded — the code-exchange token was already long-lived.");
+    return { ...refreshed, grant: "ig_refresh_token" };
+  } catch (e) {
+    // Neither grant worked. Do NOT fail the connect over this: the token we
+    // already hold is valid right now, and refusing it would block the account
+    // entirely over a token-lifetime optimisation. Hand it back with an unknown
+    // expiry — cron.refreshTokens() treats a null token_expires_at as due, so
+    // it will retry daily and record what it finds.
     console.error(
-      `[instagram login] long-lived exchange failed (HTTP ${out.status}): ${String(out.raw).slice(0, 500)}`,
+      `[instagram login] both ig_exchange_token and ig_refresh_token failed (${e.message}). ` +
+        `Proceeding with the code-exchange token; expiry unknown, the daily refresh cron will retry.`,
     );
-    throw new Error(oauthErrorMessage(out.data, "Instagram long-lived token exchange failed."));
+    return { accessToken: shortLivedToken, expiresIn: null, grant: "none" };
   }
-
-  return { accessToken: out.data.access_token, expiresIn: Number(out.data.expires_in) || null };
 }
 
 // ── Step 4 (recurring): refresh before the 60 days run out ───────────────

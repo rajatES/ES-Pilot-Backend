@@ -161,9 +161,12 @@ export class AuthService {
   async handleInstagramCallback(code: string): Promise<{ displayName: string; username: string | null }> {
     const { accessToken: shortLived } = await exchangeInstagramCode(code);
 
-    // A 60-day token is the whole point — a short-lived one would strand the
-    // account in an hour, so a failure here is fatal, not a warning.
-    const { accessToken, expiresIn } = await exchangeForLongLivedInstagramToken(shortLived);
+    // Aim for the 60-day token, but this no longer throws: Meta rejects
+    // ig_exchange_token on a Business Login token as "Unsupported request"
+    // (2026-08-27), so the helper falls back to ig_refresh_token and, failing
+    // that, to the code-exchange token with an unknown expiry. `grant` records
+    // which route actually produced the token we are storing.
+    const { accessToken, expiresIn, grant } = await exchangeForLongLivedInstagramToken(shortLived);
 
     const profile = await fetchInstagramProfile(accessToken);
 
@@ -189,6 +192,13 @@ export class AuthService {
         login: "instagram",
         account_type: profile.accountType,
         connected_at: new Date().toISOString(),
+        // Which token grant produced the stored token: "ig_exchange_token"
+        // (documented short→long), "ig_refresh_token" (the token was already
+        // long-lived), or "none" (neither worked — expiry unknown, the daily
+        // cron will keep trying). Worth persisting: it is the difference
+        // between an account with a known 60-day clock and one we are guessing
+        // about, and it is invisible otherwise.
+        token_grant: grant || "unknown",
       },
     };
 
