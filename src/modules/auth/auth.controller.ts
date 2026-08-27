@@ -5,6 +5,7 @@ import { Public } from "../../auth/public.decorator";
 import { AuthService } from "./auth.service";
 import { buildCanvaAuthUrl, canvaConfigured, exchangeCanvaCode, saveCanvaTokens } from "../../lib/canva";
 import { getYouTubeAuthUrl } from "../../lib/youtube";
+import { getInstagramAuthUrl, instagramLoginConfigured } from "../../lib/instagramOAuth";
 
 // After the OAuth dance completes we return the browser to the FRONTEND app,
 // not the backend. The provider redirect_uri (FACEBOOK_/YOUTUBE_/CANVA_REDIRECT_URI)
@@ -57,23 +58,118 @@ export class AuthController {
     return res.redirect(`https://www.facebook.com/v23.0/dialog/oauth?${params}`);
   }
 
+  // This redirect flow is ALSO the diagnostic for "connect fails and we can't
+  // see why". The JS-SDK popup renders Meta's refusal inside a window that has
+  // already closed by the time our callback runs, so the frontend can only
+  // guess. Here Meta puts the real reason in the query string — which is why
+  // error_code and error_reason are captured too, and why every message below
+  // is percent-encoded: an unencoded error_description (they contain spaces,
+  // commas and often "#") was being truncated at the first "#" by the browser,
+  // silently destroying exactly the text needed to diagnose a refusal.
   @Get("facebook/callback")
   async facebookCallback(
     @Query("code") code: string,
     @Query("error") error: string,
     @Query("error_description") errorDescription: string,
+    @Query("error_code") errorCode: string,
+    @Query("error_reason") errorReason: string,
     @Res() res: Response,
   ) {
     const app = `${frontend()}/app`;
-    if (error) return res.redirect(`${app}?error=Facebook auth failed: ${errorDescription || error}`);
-    if (!code) return res.redirect(`${app}?error=No authorization code received from Facebook.`);
+    const fail = (msg: string) => res.redirect(`${app}?error=${encodeURIComponent(msg)}`);
+
+    if (error) {
+      // Log the raw set server-side as well — the toast is transient, and this
+      // is the only durable record of what Meta actually said.
+      console.error("[facebook callback] Meta refused the authorization:", {
+        error,
+        error_code: errorCode,
+        error_reason: errorReason,
+        error_description: errorDescription,
+      });
+      const parts = [errorDescription || error, errorReason && `reason: ${errorReason}`, errorCode && `code: ${errorCode}`]
+        .filter(Boolean)
+        .join(" · ");
+      return fail(`Facebook auth failed — ${parts}`);
+    }
+    if (!code) return fail("No authorization code received from Facebook.");
 
     try {
       const savedCount = await this.auth.handleFacebookCallback(code);
-      return res.redirect(`${app}?success=Connected ${savedCount} account(s) (Facebook Pages and Instagram)`);
+      return res.redirect(
+        `${app}?success=${encodeURIComponent(`Connected ${savedCount} account(s) (Facebook Pages and Instagram)`)}`,
+      );
     } catch (err) {
       console.error("[facebook callback] error:", err.message);
-      return res.redirect(`${app}?error=Connection failed: ${err.message}`);
+      return fail(`Connection failed: ${err.message}`);
+    }
+  }
+
+  // ── Instagram (direct, Instagram Login — no Facebook Page) ───────────────
+  //
+  // The second native Instagram path. Unlike the Facebook flow above there is
+  // no JS SDK and no popup: it is a plain server-side redirect to
+  // instagram.com, so nothing here touches the Facebook App ID or its scopes.
+  //
+  // `state` is CSRF protection only — there is no per-user data to smuggle
+  // through it, because the callback writes under the shared OWNER_ID exactly
+  // like the Facebook and YouTube callbacks do. It lives in a short-lived
+  // cookie on the backend origin (the Canva pair does the same).
+  @Get("instagram/start")
+  instagramStart(@Res() res: Response) {
+    const app = `${frontend()}/app`;
+    if (!instagramLoginConfigured()) {
+      return res.redirect(
+        `${app}?error=${encodeURIComponent(
+          "Instagram direct connect isn't configured — set INSTAGRAM_APP_ID and INSTAGRAM_APP_SECRET on the backend.",
+        )}`,
+      );
+    }
+
+    const state = crypto.randomBytes(16).toString("base64url");
+    res.cookie("ig_oauth_state", state, {
+      httpOnly: true,
+      sameSite: "lax",
+      path: "/",
+      maxAge: 600_000,
+    });
+    return res.redirect(getInstagramAuthUrl(state));
+  }
+
+  @Get("instagram/callback")
+  async instagramCallback(
+    @Query("code") code: string,
+    @Query("state") state: string,
+    @Query("error") error: string,
+    @Query("error_description") errorDescription: string,
+    @Req() req: Request,
+    @Res() res: Response,
+  ) {
+    const app = `${frontend()}/app`;
+    const savedState = req.cookies?.ig_oauth_state;
+    res.clearCookie("ig_oauth_state");
+
+    const fail = (msg: string) => res.redirect(`${app}?error=${encodeURIComponent(msg)}`);
+
+    if (error) return fail(`Instagram authorization failed: ${errorDescription || error}`);
+    if (!code) return fail("No authorization code received from Instagram.");
+    // A missing cookie is the common case here, not an attack: Instagram
+    // returns through a cross-site redirect, so anything stricter than
+    // SameSite=Lax drops it. Mismatch and absence are both refusals.
+    if (!state || !savedState || state !== savedState) {
+      return fail("Instagram authorization could not be verified — please try connecting again.");
+    }
+
+    try {
+      const { displayName, username } = await this.auth.handleInstagramCallback(code);
+      return res.redirect(
+        `${app}?success=${encodeURIComponent(
+          `Connected Instagram ${username ? `@${username}` : displayName} — no Facebook Page needed.`,
+        )}`,
+      );
+    } catch (err) {
+      console.error("[instagram callback] error:", err.message);
+      return fail(`Instagram connection failed: ${err.message}`);
     }
   }
 
@@ -94,15 +190,19 @@ export class AuthController {
   @Get("youtube/callback")
   async youtubeCallback(@Query("code") code: string, @Query("error") error: string, @Res() res: Response) {
     const app = `${frontend()}/app`;
-    if (error) return res.redirect(`${app}?error=YouTube authorization failed: ${error}`);
-    if (!code) return res.redirect(`${app}?error=No authorization code received.`);
+    // Encoded for the same reason as the Facebook callback above: a raw error
+    // string ends the query at its first "#" or "&".
+    const fail = (msg: string) => res.redirect(`${app}?error=${encodeURIComponent(msg)}`);
+
+    if (error) return fail(`YouTube authorization failed: ${error}`);
+    if (!code) return fail("No authorization code received.");
 
     try {
       const count = await this.auth.handleYoutubeCallback(code);
       return res.redirect(`${app}?youtube=connected&channels=${count}`);
     } catch (err) {
       console.error("[youtube callback] error:", err.message);
-      return res.redirect(`${app}?error=YouTube connection failed: ${err.message}`);
+      return fail(`YouTube connection failed: ${err.message}`);
     }
   }
 

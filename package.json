@@ -1,8 +1,8 @@
 {
-  "name": "essentially-posting-pilot-backend",
+  "name": "es-social-post-backend",
   "version": "1.0.0",
   "private": true,
-  "description": "NestJS backend API for Essentially PostingPilot",
+  "description": "NestJS backend API for ES Social Post",
   "scripts": {
     "build": "nest build",
     "start": "nest start",

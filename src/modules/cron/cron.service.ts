@@ -3,6 +3,7 @@ import { createHash } from "crypto";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { publishFacebookPost, publishFacebookReel, publishFacebookStory, postFacebookComment, checkFacebookPostStatus, getFacebookPostMetrics } from "../../lib/facebook";
 import { publishInstagramPost, postInstagramComment, checkInstagramPostStatus, getInstagramPostMetrics } from "../../lib/instagram";
+import { refreshInstagramToken } from "../../lib/instagramOAuth";
 import { publishPostizPost, reconcilePostizTarget, getPostizPostMetrics } from "../../lib/postiz";
 import { publishYouTubeVideo, checkYouTubeVideoStatus, getYouTubeVideoAnalytics } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
@@ -29,6 +30,13 @@ const PUBLISH_BATCH_SIZE = 50;
 // incident, not something to page through.
 const READY_TARGET_SCAN = 5000;
 
+// Refresh a direct-Instagram token once it is within this many days of its
+// 60-day expiry. Wide on purpose: a refresh can only happen while the token is
+// still valid, so the margin IS the retry budget — 50 days of daily attempts
+// before an account is unrecoverable. Narrowing this trades that safety for
+// nothing, since a refresh costs one HTTP call per account per day.
+const REFRESH_WINDOW_DAYS = 50;
+
 @Injectable()
 export class CronService {
   constructor(
@@ -49,6 +57,92 @@ export class CronService {
     this.authorize(req);
     const days = Math.min(Math.max(Number(req.query?.days) || 90, 1), 365);
     return this.socialSync.sync(null, { days });
+  }
+
+  // Keep direct-Instagram (Instagram Login) tokens alive.
+  //
+  // This exists because those tokens are the ONLY expiring credential in the
+  // app that cannot be recovered without the user. Facebook Page tokens are
+  // effectively permanent; YouTube has a refresh_token that works whenever we
+  // ask; Postiz holds its own. An Instagram-Login token lasts 60 days and can
+  // only be refreshed while it is STILL VALID and at least 24h old — once it
+  // lapses there is no API call back, only a manual reconnect. So this runs
+  // daily and refreshes anything inside REFRESH_WINDOW_DAYS, which gives ~50
+  // consecutive failed days before an account is actually lost.
+  //
+  // Deliberately NOT part of accounts.sync(): sync is user-triggered and reports
+  // health, while this must run unattended whether or not anyone opens the app.
+  async refreshTokens(req: any) {
+    this.authorize(req);
+    const supabase = this.supabaseService.createServiceClient();
+
+    const { data: accounts, error } = await supabase
+      .from("social_accounts")
+      .select("id, display_name, access_token, token_expires_at, metadata, publish_via, platform")
+      .eq("user_id", OWNER_ID)
+      .eq("platform", "instagram");
+    if (error) throw new InternalServerErrorException(error.message);
+
+    // Only Instagram-Login rows have a refreshable token. Postiz rows carry no
+    // token of ours, and Facebook-Page-linked rows don't expire on this clock.
+    const due = (accounts || []).filter((a: any) => {
+      if (a.publish_via === "postiz") return false;
+      if (a.metadata?.instagram?.login !== "instagram") return false;
+      if (!a.access_token) return false;
+      if (!a.token_expires_at) return true; // unknown expiry — refresh and find out
+      const daysLeft = (new Date(a.token_expires_at).getTime() - Date.now()) / 86400000;
+      return daysLeft <= REFRESH_WINDOW_DAYS;
+    });
+
+    const results: any[] = [];
+    for (const a of due) {
+      try {
+        const { accessToken, expiresIn } = await refreshInstagramToken(a.access_token);
+        const metadata = { ...(a.metadata || {}) };
+        delete metadata.auth_error;
+        metadata.instagram = { ...(metadata.instagram || {}), refreshed_at: new Date().toISOString() };
+
+        await supabase
+          .from("social_accounts")
+          .update({
+            access_token: accessToken,
+            token_expires_at: expiresIn ? new Date(Date.now() + expiresIn * 1000).toISOString() : null,
+            publishing_ok: true,
+            metadata,
+          })
+          .eq("id", a.id);
+        results.push({ id: a.id, name: a.display_name, ok: true, expiresIn });
+      } catch (e) {
+        // A failed refresh is NOT yet a failed account — there are weeks of
+        // retries left in the window — so publishing_ok is left alone. What we
+        // must not do is stay quiet about it, or the first anyone hears is a
+        // dead account.
+        await supabase
+          .from("social_accounts")
+          .update({
+            metadata: {
+              ...(a.metadata || {}),
+              auth_error: { message: `Token refresh failed: ${e.message}`, at: new Date().toISOString() },
+            },
+          })
+          .eq("id", a.id);
+        results.push({ id: a.id, name: a.display_name, ok: false, error: e.message });
+      }
+    }
+
+    const failed = results.filter((r) => !r.ok);
+    if (results.length) {
+      await logActivity({
+        type: "account.synced",
+        title: failed.length
+          ? `Refreshed ${results.length - failed.length}/${results.length} Instagram token(s) — ${failed.length} failed`
+          : `Refreshed ${results.length} Instagram token(s)`,
+        status: failed.length ? "warning" : "info",
+        meta: failed.length ? { failed: failed.map((f) => ({ name: f.name, error: f.error })) } : {},
+      });
+    }
+
+    return { checked: (accounts || []).length, due: due.length, refreshed: results.length - failed.length, failed };
   }
 
   // Cron endpoints authenticate with a shared CRON_SECRET (Bearer header or

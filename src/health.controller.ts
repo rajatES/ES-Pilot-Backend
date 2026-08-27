@@ -6,6 +6,6 @@ export class HealthController {
   @Public()
   @Get("health")
   health() {
-    return { ok: true, service: "essentially-posting-pilot-backend", time: new Date().toISOString() };
+    return { ok: true, service: "es-social-post-backend", time: new Date().toISOString() };
   }
 }

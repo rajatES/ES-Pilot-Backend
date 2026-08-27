@@ -8,6 +8,7 @@ import {
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { logActivity } from "../../lib/activity";
 import { metaErrorMessage } from "../../lib/metaError";
+import { instagramGraphBase } from "../../lib/instagram";
 
 const GRAPH = "https://graph.facebook.com/v23.0";
 
@@ -160,8 +161,15 @@ export class AccountsService {
           continue;
         }
         if (a.platform === "instagram") {
+          // Which Graph host serves this account depends on HOW it was
+          // connected: a direct Instagram-Login row lives on
+          // graph.instagram.com and 400s on graph.facebook.com. Probing the
+          // wrong host would fail and stamp `publishing_ok: false` on every
+          // sync — falsely marking a healthy account broken, the same trap
+          // Postiz rows fell into above. instagramGraphBase() is the single
+          // place that decision is made.
           const r = await fetch(
-            `${GRAPH}/${a.external_account_id}?fields=followers_count,media_count,username&access_token=${a.access_token}`,
+            `${instagramGraphBase(a)}/${a.external_account_id}?fields=followers_count,media_count,username&access_token=${a.access_token}`,
           );
           const dd = await r.json();
           if (!r.ok) throw new Error(metaErrorMessage(dd, "Sync failed"));

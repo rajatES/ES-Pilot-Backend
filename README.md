@@ -1,6 +1,6 @@
-# Essentially PostingPilot — Backend (NestJS)
+# ES Social Post — Backend (NestJS)
 
-The API for PostingPilot. Every route the app used to serve from Next.js
+The API for ES Social Post. Every route the app used to serve from Next.js
 (`/api/*`) now lives here as a NestJS controller/service, under the same
 `/api` path prefix so the frontend only had to change origin, not paths.
 

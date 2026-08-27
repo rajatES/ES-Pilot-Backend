@@ -28,8 +28,13 @@ const REQUIRED: { key: string; url?: boolean; alt?: string }[] = [
 
 // Not fatal — the app runs, but the related feature is unavailable.
 const OPTIONAL = [
-  { key: "FACEBOOK_CLIENT_ID", feature: "Facebook/Instagram publishing" },
-  { key: "FACEBOOK_CLIENT_SECRET", feature: "Facebook/Instagram publishing" },
+  { key: "FACEBOOK_CLIENT_ID", feature: "Facebook Pages + Page-linked Instagram publishing" },
+  { key: "FACEBOOK_CLIENT_SECRET", feature: "Facebook Pages + Page-linked Instagram publishing" },
+  // Separate Meta credentials from the Facebook ones above: the Instagram App
+  // ID is issued by the app's "API setup with Instagram login" product and is a
+  // DIFFERENT value. This is the path that needs no Facebook Page.
+  { key: "INSTAGRAM_APP_ID", feature: "direct Instagram connect (no Facebook Page)" },
+  { key: "INSTAGRAM_APP_SECRET", feature: "direct Instagram connect (no Facebook Page)" },
   // Threads and personal/standalone Instagram publish through Postiz, which
   // holds those platform tokens — one workspace key covers every such channel.
   { key: "POSTIZ_API_KEY", feature: "Threads + standalone Instagram publishing (via Postiz)" },

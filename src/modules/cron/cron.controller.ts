@@ -55,4 +55,16 @@ export class CronController {
   syncPostsPost(@Req() req: Request) {
     return this.cron.syncPosts(req);
   }
+
+  // Keep direct-Instagram (Instagram Login) 60-day tokens alive. MUST be
+  // scheduled daily — see the note on CronService.refreshTokens: a lapsed token
+  // cannot be refreshed at all, only replaced by a manual reconnect.
+  @Get("refresh-tokens")
+  refreshTokensGet(@Req() req: Request) {
+    return this.cron.refreshTokens(req);
+  }
+  @Post("refresh-tokens")
+  refreshTokensPost(@Req() req: Request) {
+    return this.cron.refreshTokens(req);
+  }
 }

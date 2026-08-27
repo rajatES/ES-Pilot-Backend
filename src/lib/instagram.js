@@ -1,7 +1,27 @@
 import { fetchInsightsResilient } from "./metaInsights";
 import { metaErrorMessage } from "./metaError";
 
-const GRAPH = "https://graph.facebook.com/v23.0";
+// Instagram is reachable through two different Meta APIs, and the ONLY
+// difference that matters below is which host serves them:
+//
+//   graph.facebook.com  — "Instagram API with Facebook Login". The account is
+//                         linked to a Facebook Page and publishes with that
+//                         Page's token (lib/facebookOAuth.js connects it).
+//   graph.instagram.com — "Instagram API with Instagram Login". No Facebook
+//                         Page anywhere; the account signed in on
+//                         instagram.com (lib/instagramOAuth.js connects it).
+//
+// Same endpoints, same request/response shapes, same container→publish dance —
+// so every helper in this file serves both, and picks the host per account.
+// `metadata.instagram.login === "instagram"` is the ONLY marker for the second
+// path: both are `publish_via: "native"` with `platform: "instagram"`, because
+// both are genuinely our own publish path with our own token.
+const GRAPH_FACEBOOK = "https://graph.facebook.com/v23.0";
+const GRAPH_INSTAGRAM = "https://graph.instagram.com/v23.0";
+
+export function instagramGraphBase(account) {
+  return account?.metadata?.instagram?.login === "instagram" ? GRAPH_INSTAGRAM : GRAPH_FACEBOOK;
+}
 
 // Defaults to mock unless explicitly set to "live" — mirrors lib/facebook.js.
 function isMockMode() {
@@ -17,8 +37,8 @@ function postMedia(post) {
 }
 
 // Create one media container. Returns its id.
-async function createContainer(igUserId, accessToken, fields) {
-  const res = await fetch(`${GRAPH}/${igUserId}/media`, {
+async function createContainer(base, igUserId, accessToken, fields) {
+  const res = await fetch(`${base}/${igUserId}/media`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ...fields, access_token: accessToken })
@@ -29,11 +49,11 @@ async function createContainer(igUserId, accessToken, fields) {
 }
 
 // Video containers process asynchronously — poll status_code until FINISHED.
-async function waitForContainer(containerId, accessToken, { timeoutMs = 4 * 60 * 1000 } = {}) {
+async function waitForContainer(base, containerId, accessToken, { timeoutMs = 4 * 60 * 1000 } = {}) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const params = new URLSearchParams({ fields: "status_code,status", access_token: accessToken });
-    const res = await fetch(`${GRAPH}/${containerId}?${params}`);
+    const res = await fetch(`${base}/${containerId}?${params}`);
     const data = await res.json();
     if (!res.ok) throw new Error(metaErrorMessage(data, "Instagram container status check failed."));
     if (data.status_code === "FINISHED") return;
@@ -45,8 +65,8 @@ async function waitForContainer(containerId, accessToken, { timeoutMs = 4 * 60 *
   }
 }
 
-async function publishContainer(igUserId, accessToken, creationId) {
-  const res = await fetch(`${GRAPH}/${igUserId}/media_publish`, {
+async function publishContainer(base, igUserId, accessToken, creationId) {
+  const res = await fetch(`${base}/${igUserId}/media_publish`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ creation_id: creationId, access_token: accessToken })
@@ -76,6 +96,7 @@ export async function publishInstagramPost({ account, post }) {
   const igUserId = account.external_account_id;
   const token = account.access_token;
   const caption = post.body || "";
+  const base = instagramGraphBase(account);
 
   let creationId;
 
@@ -84,20 +105,20 @@ export async function publishInstagramPost({ account, post }) {
     if (m.type === "video") {
       // Single videos publish as Reels (Meta's canonical video type; it also
       // appears in the main feed via share_to_feed).
-      creationId = await createContainer(igUserId, token, {
+      creationId = await createContainer(base, igUserId, token, {
         media_type: "REELS",
         video_url: m.url,
         share_to_feed: true,
         caption
       });
-      await waitForContainer(creationId, token);
+      await waitForContainer(base, creationId, token);
     } else {
-      creationId = await createContainer(igUserId, token, { image_url: m.url, caption });
+      creationId = await createContainer(base, igUserId, token, { image_url: m.url, caption });
       // Even image containers aren't ready the instant they're created —
       // Instagram first has to fetch the URL. Publishing before the container
       // reaches FINISHED is what returns "Media ID is not available", so wait
       // (usually returns immediately; a bad/unreachable URL surfaces as ERROR).
-      await waitForContainer(creationId, token, { timeoutMs: 90 * 1000 });
+      await waitForContainer(base, creationId, token, { timeoutMs: 90 * 1000 });
     }
   } else {
     // Carousel: 2–10 children.
@@ -106,21 +127,21 @@ export async function publishInstagramPost({ account, post }) {
       const fields = m.type === "video"
         ? { media_type: "VIDEO", video_url: m.url, is_carousel_item: true }
         : { image_url: m.url, is_carousel_item: true };
-      const childId = await createContainer(igUserId, token, fields);
+      const childId = await createContainer(base, igUserId, token, fields);
       // Wait for each child (image or video) to finish before it joins the
       // carousel — an unready child fails the parent with "Media ID is not available".
-      await waitForContainer(childId, token, m.type === "video" ? undefined : { timeoutMs: 90 * 1000 });
+      await waitForContainer(base, childId, token, m.type === "video" ? undefined : { timeoutMs: 90 * 1000 });
       childIds.push(childId);
     }
-    creationId = await createContainer(igUserId, token, {
+    creationId = await createContainer(base, igUserId, token, {
       media_type: "CAROUSEL",
       children: childIds.join(","),
       caption
     });
-    await waitForContainer(creationId, token, { timeoutMs: 60 * 1000 }).catch(() => { /* image-only carousels often skip processing */ });
+    await waitForContainer(base, creationId, token, { timeoutMs: 60 * 1000 }).catch(() => { /* image-only carousels often skip processing */ });
   }
 
-  const externalPostId = await publishContainer(igUserId, token, creationId);
+  const externalPostId = await publishContainer(base, igUserId, token, creationId);
   return { externalPostId };
 }
 
@@ -132,7 +153,7 @@ export async function postInstagramComment({ account, mediaId, message }) {
 
   if (!account.access_token) throw new Error("Instagram access token is missing.");
 
-  const res = await fetch(`${GRAPH}/${mediaId}/comments`, {
+  const res = await fetch(`${instagramGraphBase(account)}/${mediaId}/comments`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message: message.trim(), access_token: account.access_token })
@@ -151,11 +172,12 @@ export async function getInstagramPostMetrics({ account, externalPostId }) {
   }
   if (!account.access_token) throw new Error("Instagram access token is missing.");
 
+  const base = instagramGraphBase(account);
   const params = new URLSearchParams({
     fields: "like_count,comments_count",
     access_token: account.access_token
   });
-  const res = await fetch(`${GRAPH}/${externalPostId}?${params}`);
+  const res = await fetch(`${base}/${externalPostId}?${params}`);
   const data = await res.json();
   if (!res.ok) throw new Error(metaErrorMessage(data, "Couldn't fetch Instagram metrics."));
 
@@ -176,7 +198,7 @@ export async function getInstagramPostMetrics({ account, externalPostId }) {
   // "views" replaced "impressions" for media created after mid-2024. Resilient:
   // if one metric is rejected for this media type, the others still land.
   for (const m of await fetchInsightsResilient(
-    GRAPH, externalPostId, ["reach", "views", "saved", "shares", "total_interactions"], account.access_token,
+    base, externalPostId, ["reach", "views", "saved", "shares", "total_interactions"], account.access_token,
   )) {
     const v = m.values?.[0]?.value;
     if (m.name === "reach") { metrics.reach = v ?? null; metrics.viewers = v ?? null; }
@@ -188,7 +210,7 @@ export async function getInstagramPostMetrics({ account, externalPostId }) {
 
   // Reels watch-time metrics (empty for non-reel media).
   for (const m of await fetchInsightsResilient(
-    GRAPH, externalPostId, ["ig_reels_video_view_total_time", "ig_reels_avg_watch_time"], account.access_token,
+    base, externalPostId, ["ig_reels_video_view_total_time", "ig_reels_avg_watch_time"], account.access_token,
   )) {
     const v = m.values?.[0]?.value;
     if (m.name === "ig_reels_video_view_total_time") metrics.video_watch_time = v != null ? Math.round(v / 1000) : null;
@@ -207,7 +229,7 @@ export async function listInstagramMedia({ account, since, until, max = 200 }) {
   const sinceMs = since ? new Date(since).getTime() : 0;
   const untilMs = until ? new Date(until).getTime() : Infinity;
   const fields = "id,caption,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp,comments_count,like_count";
-  let url = `${GRAPH}/${account.external_account_id}/media?fields=${fields}&limit=25&access_token=${account.access_token}`;
+  let url = `${instagramGraphBase(account)}/${account.external_account_id}/media?fields=${fields}&limit=25&access_token=${account.access_token}`;
 
   const out = [];
   try {
@@ -242,11 +264,12 @@ export async function checkInstagramPostStatus({ account, externalPostId }) {
   }
   if (!account.access_token) return { exists: null, error: "No access token." };
 
+  const base = instagramGraphBase(account);
   const params = new URLSearchParams({
     fields: "id,caption",
     access_token: account.access_token
   });
-  const res = await fetch(`${GRAPH}/${externalPostId}?${params}`);
+  const res = await fetch(`${base}/${externalPostId}?${params}`);
   const data = await res.json();
 
   if (res.ok) return { exists: true };
@@ -256,7 +279,7 @@ export async function checkInstagramPostStatus({ account, externalPostId }) {
   if (code === 10 || code === 100 || code === 803) {
     // Verify we can still read the account to confirm permissions are ok
     const accountRes = await fetch(
-      `${GRAPH}/${account.external_account_id}?fields=id&access_token=${account.access_token}`
+      `${base}/${account.external_account_id}?fields=id&access_token=${account.access_token}`
     );
     if (accountRes.ok) return { exists: false };
     return { exists: null, error: "Cannot verify — account is unreadable with this token." };
