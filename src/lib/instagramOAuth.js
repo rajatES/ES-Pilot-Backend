@@ -34,6 +34,20 @@ const AUTH_HOST = "https://www.instagram.com";
 const TOKEN_HOST = "https://api.instagram.com";
 // Where every subsequent call goes, token exchange/refresh included.
 const GRAPH_HOST = "https://graph.instagram.com";
+// Every graph.instagram.com path must carry the API version.
+//
+// Meta's curl examples for the token endpoints omit it, and following them gives
+// `IGApiException` "Unsupported request - method type: get" on a REAL token
+// (observed live 2026-08-27 on BOTH /access_token and /refresh_access_token,
+// with both GET and POST). The versioned `/v23.0/me` call in the same file works
+// fine against the same host and token, which is what isolates the version as
+// the difference rather than the grant or the method.
+//
+// A deliberately invalid token hides this: it fails at decode with
+// `OAuthException` "Failed to decode" on versioned and unversioned paths alike,
+// so probing with a fake token cannot tell them apart. Don't "simplify" these
+// back to the unversioned form because the docs show it that way.
+const API_VERSION = "v23.0";
 
 // The permission set this path actually uses:
 //   instagram_business_basic            — read the profile; also what makes a
@@ -168,8 +182,8 @@ export async function exchangeForLongLivedInstagramToken(shortLivedToken) {
   const attempt = async (method) => {
     const res =
       method === "GET"
-        ? await fetch(`${GRAPH_HOST}/access_token?${params}`)
-        : await fetch(`${GRAPH_HOST}/access_token`, {
+        ? await fetch(`${GRAPH_HOST}/${API_VERSION}/access_token?${params}`)
+        : await fetch(`${GRAPH_HOST}/${API_VERSION}/access_token`, {
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body: params,
@@ -237,7 +251,7 @@ export async function refreshInstagramToken(longLivedToken) {
     grant_type: "ig_refresh_token",
     access_token: String(longLivedToken).trim(),
   });
-  const res = await fetch(`${GRAPH_HOST}/refresh_access_token?${params}`);
+  const res = await fetch(`${GRAPH_HOST}/${API_VERSION}/refresh_access_token?${params}`);
   const raw = await res.text();
   let data;
   try {
@@ -269,7 +283,7 @@ export async function fetchInstagramProfile(accessToken) {
     fields: "user_id,username,name,account_type,profile_picture_url,followers_count,media_count",
     access_token: accessToken,
   });
-  const res = await fetch(`${GRAPH_HOST}/v23.0/me?${params}`);
+  const res = await fetch(`${GRAPH_HOST}/${API_VERSION}/me?${params}`);
   const data = await res.json();
   if (!res.ok || (!data?.user_id && !data?.id)) {
     throw new Error(oauthErrorMessage(data, "Couldn't read the Instagram profile."));
