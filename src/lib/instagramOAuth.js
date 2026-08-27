@@ -96,12 +96,14 @@ export function getInstagramAuthUrl(state) {
 // with a form-encoded body, and it rejects a JSON body. The code is single-use
 // and valid for one hour.
 export async function exchangeInstagramCode(code) {
+  // Trimmed for the same reason as the long-lived exchange: a stray newline in
+  // the server's .env otherwise reaches Meta inside the credential.
   const body = new URLSearchParams({
-    client_id: process.env.INSTAGRAM_APP_ID,
-    client_secret: process.env.INSTAGRAM_APP_SECRET,
+    client_id: (process.env.INSTAGRAM_APP_ID || "").trim(),
+    client_secret: (process.env.INSTAGRAM_APP_SECRET || "").trim(),
     grant_type: "authorization_code",
     redirect_uri: redirectUri(),
-    code,
+    code: String(code).trim(),
   });
 
   const res = await fetch(`${TOKEN_HOST}/oauth/access_token`, {
@@ -109,8 +111,15 @@ export async function exchangeInstagramCode(code) {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body,
   });
-  const data = await res.json();
+  const raw = await res.text();
+  let data;
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch {
+    data = null;
+  }
   if (!res.ok || !data?.access_token) {
+    console.error(`[instagram login] code exchange failed (HTTP ${res.status}): ${String(raw).slice(0, 500)}`);
     throw new Error(oauthErrorMessage(data, "Instagram rejected the authorization code."));
   }
   return {
@@ -125,17 +134,71 @@ export async function exchangeInstagramCode(code) {
 // ── Step 3: short-lived → long-lived (60 days) ───────────────────────────
 
 export async function exchangeForLongLivedInstagramToken(shortLivedToken) {
+  if (!shortLivedToken) {
+    throw new Error("Instagram long-lived token exchange failed. — no short-lived token to exchange.");
+  }
+
+  // .trim() matters here even though instagramLoginConfigured() already trims:
+  // that check reads the var, this one SENDS it. A trailing newline in the
+  // server's .env would otherwise travel into client_secret and Meta's
+  // complaint would name the method or the request, never the whitespace.
   const params = new URLSearchParams({
     grant_type: "ig_exchange_token",
-    client_secret: process.env.INSTAGRAM_APP_SECRET,
-    access_token: shortLivedToken,
+    client_secret: (process.env.INSTAGRAM_APP_SECRET || "").trim(),
+    access_token: String(shortLivedToken).trim(),
   });
-  const res = await fetch(`${GRAPH_HOST}/access_token?${params}`);
-  const data = await res.json();
-  if (!res.ok || !data?.access_token) {
-    throw new Error(oauthErrorMessage(data, "Instagram long-lived token exchange failed."));
+
+  // Documented as GET (and GET is what works). But this exact call has been
+  // seen to come back with Meta's "Unsupported request - method type: get"
+  // (2026-08-27, live connect attempt), and probing the endpoint shows it
+  // accepts POST with the same parameters. So: try GET, and if Meta rejects the
+  // METHOD specifically, retry once as POST rather than failing the connect.
+  // Any other error is returned as-is — a bad secret must not be retried into
+  // looking like a method problem.
+  const attempt = async (method) => {
+    const res =
+      method === "GET"
+        ? await fetch(`${GRAPH_HOST}/access_token?${params}`)
+        : await fetch(`${GRAPH_HOST}/access_token`, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: params,
+          });
+    const raw = await res.text();
+    let data;
+    try {
+      data = raw ? JSON.parse(raw) : null;
+    } catch {
+      data = null;
+    }
+    return { ok: res.ok, status: res.status, data, raw };
+  };
+
+  let out = await attempt("GET");
+
+  const methodRejected = (o) =>
+    /unsupported\s+(request|get|post)|method type/i.test(
+      o.data?.error?.message || o.data?.error_message || o.raw || "",
+    );
+
+  if ((!out.ok || !out.data?.access_token) && methodRejected(out)) {
+    console.warn(
+      `[instagram login] long-lived exchange rejected GET (${out.status}: ${String(out.raw).slice(0, 200)}) — retrying as POST.`,
+    );
+    out = await attempt("POST");
   }
-  return { accessToken: data.access_token, expiresIn: Number(data.expires_in) || null };
+
+  if (!out.ok || !out.data?.access_token) {
+    // Log the raw body: Meta's message alone has repeatedly been too vague to
+    // act on here, and this call happens once during an interactive connect —
+    // there is no second chance to capture it.
+    console.error(
+      `[instagram login] long-lived exchange failed (HTTP ${out.status}): ${String(out.raw).slice(0, 500)}`,
+    );
+    throw new Error(oauthErrorMessage(out.data, "Instagram long-lived token exchange failed."));
+  }
+
+  return { accessToken: out.data.access_token, expiresIn: Number(out.data.expires_in) || null };
 }
 
 // ── Step 4 (recurring): refresh before the 60 days run out ───────────────
@@ -145,13 +208,24 @@ export async function exchangeForLongLivedInstagramToken(shortLivedToken) {
 // has actually expired — the account has to be reconnected by hand — which is
 // why the cron sweep runs daily with a wide margin instead of cutting it fine.
 export async function refreshInstagramToken(longLivedToken) {
+  if (!longLivedToken) throw new Error("Instagram token refresh failed. — no token to refresh.");
+
   const params = new URLSearchParams({
     grant_type: "ig_refresh_token",
-    access_token: longLivedToken,
+    access_token: String(longLivedToken).trim(),
   });
   const res = await fetch(`${GRAPH_HOST}/refresh_access_token?${params}`);
-  const data = await res.json();
+  const raw = await res.text();
+  let data;
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch {
+    data = null;
+  }
   if (!res.ok || !data?.access_token) {
+    // This runs unattended in the daily cron, so the raw body is the only
+    // record of why an account is drifting toward an unrecoverable expiry.
+    console.error(`[instagram login] token refresh failed (HTTP ${res.status}): ${String(raw).slice(0, 500)}`);
     throw new Error(oauthErrorMessage(data, "Instagram token refresh failed."));
   }
   return { accessToken: data.access_token, expiresIn: Number(data.expires_in) || null };
