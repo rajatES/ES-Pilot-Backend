@@ -190,6 +190,7 @@ function toApiPost(post: any, approvals?: any[]) {
     linkUrl: post.link_url,
     firstComment: post.first_comment,
     contentType: post.content_type,
+    tags: Array.isArray(post.tags) ? post.tags : [],
     platformCaptions: post.platform_captions || null,
     platformOptions: post.platform_options || null,
     source: post.source || "app",
@@ -524,6 +525,9 @@ export class PublicApiService {
         firstComment: p.firstComment || null,
         linkInComment: typeof p.linkInComment === "boolean" ? p.linkInComment : undefined,
         contentType: contentType || null,
+        // Free-form editorial tags; normalized (trim/lowercase/dedupe, "#" stripped)
+        // by PostsService.create so API rows match composer rows exactly.
+        tags: p.tags ?? null,
         socialAccountIds: accountIds,
         scheduledFor,
         saveAs,

@@ -27,6 +27,40 @@ export function isValidContentType(value) {
   return !value || CONTENT_TYPES.includes(value);
 }
 
+// ── Tags ────────────────────────────────────────────────────────────────────
+// Free-form per-post editorial tags ("nascar", "daytona"). Lives here rather
+// than in the composer for the same reason everything else in this file does:
+// an API or CSV caller must produce identical rows to the UI.
+//
+// Normalized hard, because these are meant to be grouped and filtered later and
+// "NASCAR", "nascar " and "#nascar" arriving as three different tags would make
+// every count wrong:
+//   - trimmed, lowercased
+//   - a leading "#" stripped (people type hashtags out of habit)
+//   - de-duplicated, order preserved
+//   - blanks dropped
+// Accepts either an array or a comma-separated string, so a CSV column and a
+// JSON array both work.
+export const MAX_TAGS = 20;
+export const MAX_TAG_LENGTH = 40;
+
+export function normalizeTags(raw) {
+  if (raw === undefined || raw === null || raw === "") return [];
+  const list = Array.isArray(raw) ? raw : String(raw).split(",");
+  const out = [];
+  for (const item of list) {
+    const tag = String(item ?? "")
+      .trim()
+      .replace(/^#+/, "")
+      .trim()
+      .toLowerCase()
+      .slice(0, MAX_TAG_LENGTH);
+    if (tag && !out.includes(tag)) out.push(tag);
+    if (out.length >= MAX_TAGS) break;
+  }
+  return out;
+}
+
 // ── First comment ───────────────────────────────────────────────────────────
 // Meta down-ranks captions that carry an outbound link, so the house style is to
 // publish the link as the first comment instead — "link in comment", the `lic`

@@ -174,6 +174,11 @@ function buildValue({ caption, media, firstComment }) {
   const value = [{ content: caption || "", image: media }];
   // Instagram comments can't carry media, and a Threads reply has none of its
   // own here either — text only in both cases.
+  //
+  // Postiz's own agent reference payload carries an optional `delay` (seconds)
+  // on comment entries. We deliberately DON'T send it: this path is confirmed
+  // working as-is (2026-08-27), and a delay would only postpone a reply to a
+  // post that is already live. Don't add it speculatively.
   if (firstComment?.trim()) value.push({ content: firstComment.trim(), image: [] });
   return value;
 }
@@ -204,6 +209,32 @@ function buildSettings({ provider, platform, igFormat, options = {} }) {
     if (options.paidPartnership) settings.paid_partnership = true;
   }
   return settings;
+}
+
+// Our per-post tags, in the only shape Postiz's create-post will accept.
+//
+// Determined empirically on 2026-08-27, because the API reference only ever
+// shows `tags: []`:
+//   ["nascar"]                       -> 400 "must be either object or array"
+//   [{ value, label }]               -> 201, and Postiz stores NOTHING
+//   [{ name }]                       -> 201, and Postiz stores NOTHING
+//
+// So a bare string is rejected outright, and an object is accepted but dropped
+// unless it names a tag that already exists in the workspace — `value` is a tag
+// id, not free text — and the public API exposes no way to list or create tags
+// (/tags, /tags/list and /posts/tags all 404).
+//
+// We therefore send the accepted object shape and treat the platform side as
+// BEST EFFORT: the tags are ours, stored on `scheduled_posts.tags`, and used for
+// our own filtering and reporting. They will start appearing in Postiz only if
+// tags of the same name are created there. Sending them costs nothing and means
+// the payload is already right if that changes; what we must not do is pretend
+// this is a working Postiz feature.
+function postizTags(tags) {
+  if (!Array.isArray(tags)) return [];
+  return tags
+    .filter((t) => typeof t === "string" && t.trim())
+    .map((t) => ({ value: t.trim(), label: t.trim() }));
 }
 
 // Ordered media for a post — same normalization the other platform libs do.
@@ -254,7 +285,8 @@ export async function publishPostizPost({ account, post, options = {}, firstComm
       // Our own UTM helper may already have rewritten the link; don't let Postiz
       // reshorten it, or the utm_* params we appended stop being attributable.
       shortLink: false,
-      tags: [],
+      // Best effort — see postizTags() for why Postiz drops unknown tags.
+      tags: postizTags(post.tags),
       posts: [
         {
           integration: { id: integrationId },

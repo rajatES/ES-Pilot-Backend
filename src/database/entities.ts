@@ -283,6 +283,19 @@ export class ScheduledPost {
   @Column({ name: "content_type", type: "text", nullable: true })
   content_type: string | null;
 
+  // Free-form editorial tags, e.g. ["nascar", "daytona"]. Distinct from
+  // `content_type` (a fixed reporting vocabulary) and from
+  // `social_accounts.category` (the sport a whole ACCOUNT belongs to) — this is
+  // per-post, and a post can carry several. Added 2026-08-27 because there was
+  // no way to label an individual post at all: the only "tag" in the app was
+  // the account's own category, which an author cannot set per post and which
+  // non-admins cannot set at all.
+  //
+  // text[] with a '{}' default matches design_templates.tags and
+  // media_assets.tags, so `contains` filtering works the same way.
+  @Column({ type: "text", array: true, default: () => "'{}'" })
+  tags: string[];
+
   @Column({ type: "jsonb", nullable: true })
   recurrence: Record<string, any> | null;
 

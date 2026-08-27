@@ -37,6 +37,7 @@ import {
   isValidContentType,
   linkInFirstCommentEnabled,
   normalizeContentType,
+  normalizeTags,
   resolveFirstComment,
 } from "../../lib/postFields";
 // @ts-ignore - shared auto-approve deadline helper.
@@ -107,6 +108,7 @@ export class PostsService {
       scheduledFor,
       socialAccountIds,
       contentType,
+      tags,
       templateId,
       firstComment,
       linkInComment,
@@ -139,6 +141,10 @@ export class PostsService {
     if (!isValidContentType(cType)) {
       throw new BadRequestException(`Invalid contentType "${contentType}" — use ${CONTENT_TYPES_HINT}.`);
     }
+
+    // Free-form editorial tags. Normalized here (not in the composer) so the
+    // Developer API and CSV import produce identical rows — see postFields.js.
+    const postTags = normalizeTags(tags);
 
     // The workspace "link in first comment" policy is applied here rather than in
     // the composer, so the Developer API and CSV import honor it too. `linkInComment`
@@ -187,6 +193,7 @@ export class PostsService {
           content_type: cType || null,
           template_id: templateId || null,
           first_comment: resolvedFirstComment,
+          tags: postTags,
           platform_captions: pCaptions,
           platform_options: pOptions,
           source: postSource,
@@ -289,6 +296,7 @@ export class PostsService {
         content_type: cType || null,
         template_id: templateId || null,
         first_comment: resolvedFirstComment,
+        tags: postTags,
         platform_captions: pCaptions,
         platform_options: pOptions,
         source: postSource,
@@ -797,6 +805,9 @@ export class PostsService {
             appendLink,
           }),
           content_type: contentTypeRaw || null,
+          // normalizeTags accepts a comma-separated string, which is what a CSV
+          // cell gives us — so a `tags` column needs no extra parsing here.
+          tags: normalizeTags(row.tags),
           scheduled_for: when.toISOString(),
           status: "scheduled",
           source: "csv",
