@@ -41,22 +41,36 @@ if (mode !== "list" && !names.length) {
   process.exit(1);
 }
 
-// Minimal .env parse (CRLF-safe) — same approach as scripts/reset-password.mjs.
+// Config comes from the environment first, then from backend/.env for the
+// values it didn't already carry. The .env is OPTIONAL on purpose: on the
+// server this runs inside the backend container, where compose supplies every
+// value through env_file and .dockerignore keeps .env out of the image — so
+// insisting on the file would make the script unrunnable exactly where it is
+// needed. Locally the file is present and fills everything in.
+//
+// process.env wins because compose's `environment:` block overrides env_file
+// (DB_HOST=postgres-db inside the network vs localhost in the file), and the
+// running container's view is the correct one.
 const env = {};
-const envPath = join(dirname(fileURLToPath(import.meta.url)), "..", ".env");
-for (let line of readFileSync(envPath, "utf8").split(/\r?\n/)) {
-  line = line.trim();
-  if (!line || line.startsWith("#")) continue;
-  const i = line.indexOf("=");
-  if (i > 0) env[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+try {
+  const envPath = join(dirname(fileURLToPath(import.meta.url)), "..", ".env");
+  for (let line of readFileSync(envPath, "utf8").split(/\r?\n/)) {
+    line = line.trim();
+    if (!line || line.startsWith("#")) continue;
+    const i = line.indexOf("=");
+    if (i > 0) env[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  }
+} catch {
+  // No .env — running in the container, where the environment already has it.
 }
+const cfg = (k, d) => process.env[k] || env[k] || d;
 
 const pool = new pg.Pool({
-  host: env.DB_HOST || "localhost",
-  port: Number(env.DB_PORT) || 5432,
-  user: env.DB_USERNAME || "postgres",
-  password: env.DB_PASSWORD || "password",
-  database: env.DB_NAME || "posting_pilot_db",
+  host: cfg("DB_HOST", "localhost"),
+  port: Number(cfg("DB_PORT", "5432")) || 5432,
+  user: cfg("DB_USERNAME", "postgres"),
+  password: cfg("DB_PASSWORD", "password"),
+  database: cfg("DB_NAME", "posting_pilot_db"),
 });
 
 const label = (r) => `${r.display_name} (${r.platform})`;

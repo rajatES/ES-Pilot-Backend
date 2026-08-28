@@ -46,21 +46,32 @@ const CHANNEL = valueOf("--channel");
 const PLATFORM = valueOf("--platform");
 const AS_JSON = has("--json");
 
-// Minimal .env parse (CRLF-safe) — same approach as reset-password.mjs.
+// Config comes from the environment first, then from backend/.env for the
+// values it didn't already carry. The .env is OPTIONAL on purpose: on the
+// server this runs inside the backend container, where compose supplies every
+// value through env_file and .dockerignore keeps .env out of the image — so
+// insisting on the file would make the script unrunnable exactly where it is
+// needed. Locally the file is present and fills everything in.
 const here = dirname(fileURLToPath(import.meta.url));
-for (let line of readFileSync(join(here, "..", ".env"), "utf8").split(/\r?\n/)) {
-  line = line.trim();
-  if (!line || line.startsWith("#")) continue;
-  const i = line.indexOf("=");
-  if (i > 0 && !process.env[line.slice(0, i).trim()]) {
-    process.env[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+try {
+  for (let line of readFileSync(join(here, "..", ".env"), "utf8").split(/\r?\n/)) {
+    line = line.trim();
+    if (!line || line.startsWith("#")) continue;
+    const i = line.indexOf("=");
+    if (i > 0 && !process.env[line.slice(0, i).trim()]) {
+      process.env[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+    }
   }
+} catch {
+  // No .env — running in the container, where the environment already has it.
 }
 
 const API = (process.env.POSTIZ_API_URL || "https://api.postiz.com/public/v1").replace(/\/$/, "");
 const KEY = (process.env.POSTIZ_API_KEY || "").trim();
 if (!KEY) {
-  console.error("POSTIZ_API_KEY is not set in backend/.env — nothing to audit against.");
+  console.error("POSTIZ_API_KEY is not set — nothing to audit against.");
+  console.error("  in the container: it should come from compose env_file (.env next to docker-compose.yml)");
+  console.error("  on a dev machine: set it in backend/.env");
   process.exit(1);
 }
 
