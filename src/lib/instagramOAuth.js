@@ -155,6 +155,92 @@ export async function exchangeInstagramCode(code) {
   };
 }
 
+// ── TEMPORARY: which long-lived exchange does Meta actually accept? ──────
+//
+// SCAFFOLDING (added 2026-08-27). Delete this function and its one call site
+// once the working variant is known.
+//
+// Why it has to live here rather than in a script: the only token that reaches
+// the failing code path is the short-lived one, which exists for about a second
+// inside an interactive connect and is never persisted. Probing from outside
+// with a synthetic token is useless — an undecodable token fails earlier, with
+// `OAuthException` "Failed to decode", so EVERY variant looks healthy. Three
+// hypotheses (missing API version, wrong grant, wrong HTTP method) were each
+// "confirmed" by such a probe and each turned out wrong against a real token.
+//
+// So: on failure, try the candidates with the real token and report which one
+// Meta accepts. Never logs a token value — only the variant label, the status,
+// and Meta's error message.
+async function probeLongLivedVariants(token) {
+  const secret = (process.env.INSTAGRAM_APP_SECRET || "").trim();
+  const appId = (process.env.INSTAGRAM_APP_ID || "").trim();
+
+  const base = { grant_type: "ig_exchange_token", client_secret: secret, access_token: token };
+  const candidates = [
+    ["IG unversioned GET", "https://graph.instagram.com/access_token", "GET", base],
+    ["IG v23.0 GET", "https://graph.instagram.com/v23.0/access_token", "GET", base],
+    ["IG v22.0 GET", "https://graph.instagram.com/v22.0/access_token", "GET", base],
+    ["IG v21.0 GET", "https://graph.instagram.com/v21.0/access_token", "GET", base],
+    ["IG v23.0 POST", "https://graph.instagram.com/v23.0/access_token", "POST", base],
+    // Maybe client_id is required alongside the secret, despite the docs.
+    ["IG v23.0 GET +client_id", "https://graph.instagram.com/v23.0/access_token", "GET", { ...base, client_id: appId }],
+    // Some Instagram edges take the token as a Bearer header instead.
+    ["IG v23.0 GET bearer", "https://graph.instagram.com/v23.0/access_token", "GET_BEARER", { grant_type: "ig_exchange_token", client_secret: secret }],
+    // The Facebook host serves an oauth/access_token edge; worth one shot. It
+    // requires client_id (it answered "Missing client_id parameter" without),
+    // and it names the param fb_exchange_token rather than access_token.
+    [
+      "FB v23.0 oauth GET",
+      "https://graph.facebook.com/v23.0/oauth/access_token",
+      "GET",
+      { grant_type: "ig_exchange_token", client_id: appId, client_secret: secret, access_token: token },
+    ],
+    [
+      "FB v23.0 fb_exchange",
+      "https://graph.facebook.com/v23.0/oauth/access_token",
+      "GET",
+      { grant_type: "fb_exchange_token", client_id: appId, client_secret: secret, fb_exchange_token: token },
+    ],
+    // And the refresh grant, in case the code-exchange token is already long.
+    ["IG v23.0 refresh GET", "https://graph.instagram.com/v23.0/refresh_access_token", "GET", { grant_type: "ig_refresh_token", access_token: token }],
+    ["IG unversioned refresh GET", "https://graph.instagram.com/refresh_access_token", "GET", { grant_type: "ig_refresh_token", access_token: token }],
+  ];
+
+  console.log("[instagram login] --- probing long-lived exchange variants (temporary diagnostic) ---");
+  for (const [label, url, method, params] of candidates) {
+    const qs = new URLSearchParams(params);
+    try {
+      let res;
+      if (method === "GET") {
+        res = await fetch(`${url}?${qs}`);
+      } else if (method === "GET_BEARER") {
+        res = await fetch(`${url}?${qs}`, { headers: { Authorization: `Bearer ${token}` } });
+      } else {
+        res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: qs,
+        });
+      }
+      const raw = await res.text();
+      let msg = raw;
+      try {
+        const j = JSON.parse(raw);
+        // Never print the token: report only whether one came back.
+        msg = j?.access_token
+          ? `SUCCESS access_token returned, expires_in=${j.expires_in ?? "(none)"}`
+          : j?.error?.message || j?.error_message || raw;
+      } catch {
+        /* keep raw */
+      }
+      console.log(`[instagram login]   ${res.ok && /SUCCESS/.test(msg) ? "==> WORKS" : "        fail"}  ${label.padEnd(26)} HTTP ${res.status}  ${String(msg).slice(0, 160)}`);
+    } catch (e) {
+      console.log(`[instagram login]           fail  ${label.padEnd(26)} network: ${e.message}`);
+    }
+  }
+  console.log("[instagram login] --- end probe ---");
+}
+
 // ── Step 3: short-lived → long-lived (60 days) ───────────────────────────
 
 export async function exchangeForLongLivedInstagramToken(shortLivedToken) {
@@ -234,6 +320,14 @@ export async function exchangeForLongLivedInstagramToken(shortLivedToken) {
       `[instagram login] both ig_exchange_token and ig_refresh_token failed (${e.message}). ` +
         `Proceeding with the code-exchange token; expiry unknown, the daily refresh cron will retry.`,
     );
+    // TEMPORARY: identify the variant Meta accepts, using the real token. This
+    // is the only place that token exists. Remove with probeLongLivedVariants().
+    // Deliberately best-effort — a probe must never be what breaks a connect.
+    try {
+      await probeLongLivedVariants(shortLivedToken);
+    } catch (probeError) {
+      console.warn(`[instagram login] variant probe itself failed: ${probeError.message}`);
+    }
     return { accessToken: shortLivedToken, expiresIn: null, grant: "none" };
   }
 }
