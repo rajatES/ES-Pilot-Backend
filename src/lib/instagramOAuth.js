@@ -146,6 +146,11 @@ export async function exchangeInstagramCode(code) {
     `[instagram login] code exchange ok — fields: [${Object.keys(data).join(", ")}]` +
       (data.expires_in !== undefined ? `, expires_in=${data.expires_in}s (~${Math.round(Number(data.expires_in) / 86400)}d)` : ", no expires_in"),
   );
+  // The granted scopes are not a secret, and they decide whether the token can
+  // be exchanged at all: Meta documents ig_exchange_token / ig_refresh_token as
+  // requiring `instagram_business_basic`. If the user unticked a permission, or
+  // the app only holds some, that is invisible until printed here.
+  console.log(`[instagram login] granted permissions: ${JSON.stringify(data.permissions ?? null)}`);
   return {
     accessToken: data.access_token,
     // The Instagram-scoped user id. Kept as a fallback for the profile lookup,
@@ -207,6 +212,31 @@ async function probeLongLivedVariants(token) {
   ];
 
   console.log("[instagram login] --- probing long-lived exchange variants (temporary diagnostic) ---");
+
+  // Control: does graph.instagram.com work AT ALL for this token? If /me
+  // succeeds while every token endpoint says "unsupported", the host and token
+  // are fine and only those endpoints are unavailable to this app — which means
+  // there is nothing to fix in our request and the code-exchange token is
+  // simply what we get. If /me ALSO fails, the problem is the token or the
+  // app's Instagram setup, not the exchange, and this whole line of
+  // investigation has been aimed at the wrong thing.
+  try {
+    const meRes = await fetch(
+      `${GRAPH_HOST}/${API_VERSION}/me?fields=user_id,username&access_token=${encodeURIComponent(token)}`,
+    );
+    const meRaw = await meRes.text();
+    let meMsg = meRaw;
+    try {
+      const j = JSON.parse(meRaw);
+      // Username is fine to log; it is what the user just authorized.
+      meMsg = j?.user_id || j?.id ? `SUCCESS username=${j.username ?? "(none)"}` : j?.error?.message || meRaw;
+    } catch {
+      /* keep raw */
+    }
+    console.log(`[instagram login]   CONTROL /me  HTTP ${meRes.status}  ${String(meMsg).slice(0, 160)}`);
+  } catch (e) {
+    console.log(`[instagram login]   CONTROL /me  network: ${e.message}`);
+  }
   for (const [label, url, method, params] of candidates) {
     const qs = new URLSearchParams(params);
     try {
