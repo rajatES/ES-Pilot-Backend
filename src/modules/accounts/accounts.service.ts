@@ -16,16 +16,76 @@ const GRAPH = "https://graph.facebook.com/v23.0";
 export class AccountsService {
   constructor(private readonly supabaseService: SupabaseService) {}
 
-  // PATCH /api/accounts/:id — manual sport/category override.
-  async updateCategory(id: string, category: any) {
+  // Posts still sitting in the queue for these accounts. Locking doesn't touch
+  // them — they stay scheduled and will FAIL at send time with "… is locked"
+  // rather than publishing. Deleting or retargeting them is an editorial call,
+  // not something a lock should do silently, so we count them and tell the
+  // admin instead.
+  private async queuedForAccounts(supabase: any, ids: string[]) {
+    const { data } = await supabase
+      .from("post_targets")
+      .select("id, status, social_account_id, scheduled_posts(status)")
+      .in("social_account_id", ids)
+      .eq("status", "scheduled");
+    return (data || []).filter((t: any) =>
+      ["scheduled", "pending_review"].includes(t.scheduled_posts?.status),
+    ).length;
+  }
+
+  // PATCH /api/accounts/:id — manual sport/category override, and the page
+  // lock. Both are per-account settings on the same row, so they share one
+  // endpoint; each key is applied only when the caller SENT it, so a category
+  // patch never disturbs the lock and vice versa.
+  async update(id: string, body: any, me?: any) {
     const supabase = this.supabaseService.createServiceClient();
+    const patch: Record<string, any> = {};
+
+    if (body && "category" in body) patch.category = body.category || null;
+
+    let lockChange: boolean | null = null;
+    if (body && "locked" in body) {
+      // Same gate as disconnect: locking a page is a workspace policy decision,
+      // not a personal preference.
+      if (!me || (me.role !== "admin" && !me.is_group_head)) {
+        throw new ForbiddenException("Only an admin or Group Head can lock or unlock a page.");
+      }
+      lockChange = body.locked === true || body.locked === "true";
+      patch.posting_locked = lockChange;
+    }
+
+    if (!Object.keys(patch).length) throw new BadRequestException("Nothing to update.");
+
+    // Counted BEFORE the write so the number reflects what the lock stranded.
+    const queuedAffected = lockChange === true ? await this.queuedForAccounts(supabase, [id]) : 0;
+
     const { error } = await supabase
       .from("social_accounts")
-      .update({ category: category || null })
+      .update(patch)
       .eq("id", id)
       .eq("user_id", OWNER_ID);
     if (error) throw new InternalServerErrorException(error.message);
-    return { ok: true };
+
+    if (lockChange !== null) {
+      const { data: account } = await supabase
+        .from("social_accounts")
+        .select("display_name, platform")
+        .eq("id", id)
+        .maybeSingle();
+      const name = account?.display_name || "Account";
+      await logActivity({
+        type: lockChange ? "account.locked" : "account.unlocked",
+        title: lockChange ? `Locked ${name} — posting is off` : `Unlocked ${name} — posting is back on`,
+        status: lockChange ? "warning" : "info",
+        meta: {
+          accountId: id,
+          platform: account?.platform || null,
+          by: me?.display_name || me?.email || null,
+          queuedAffected,
+        },
+      });
+    }
+
+    return { ok: true, queuedAffected };
   }
 
   // DELETE /api/accounts/:id
@@ -40,10 +100,12 @@ export class AccountsService {
     return { ok: true };
   }
 
-  // POST /api/accounts/bulk — category change or disconnect for many accounts.
-  async bulk(payload: any) {
+  // POST /api/accounts/bulk — category change, lock/unlock, or disconnect for
+  // many accounts at once.
+  async bulk(payload: any, me?: any) {
     const supabase = this.supabaseService.createServiceClient();
     const { action, ids, value } = payload || {};
+    let queuedAffected = 0;
 
     if (!Array.isArray(ids) || !ids.length) {
       throw new BadRequestException("No accounts selected.");
@@ -57,6 +119,27 @@ export class AccountsService {
         .eq("user_id", OWNER_ID);
       if (error) throw new InternalServerErrorException(error.message);
       await logActivity({ type: "account.updated", title: `Set ${ids.length} account(s) to ${value}`, status: "info" });
+    } else if (action === "lock") {
+      // Lock or unlock many pages at once. Deliberately NOT the same thing as
+      // disconnect: the rows stay, so insights, followers and post history keep
+      // flowing — only publishing is refused.
+      if (!me || (me.role !== "admin" && !me.is_group_head)) {
+        throw new ForbiddenException("Only an admin or Group Head can lock or unlock a page.");
+      }
+      const locked = value === true || value === "true";
+      queuedAffected = locked ? await this.queuedForAccounts(supabase, ids) : 0;
+      const { error } = await supabase
+        .from("social_accounts")
+        .update({ posting_locked: locked })
+        .in("id", ids)
+        .eq("user_id", OWNER_ID);
+      if (error) throw new InternalServerErrorException(error.message);
+      await logActivity({
+        type: locked ? "account.locked" : "account.unlocked",
+        title: `${locked ? "Locked" : "Unlocked"} ${ids.length} page(s)`,
+        status: locked ? "warning" : "info",
+        meta: { accountIds: ids, by: me?.display_name || me?.email || null, queuedAffected },
+      });
     } else if (action === "disconnect") {
       const { error } = await supabase.from("social_accounts").delete().in("id", ids).eq("user_id", OWNER_ID);
       if (error) throw new InternalServerErrorException(error.message);
@@ -74,7 +157,7 @@ export class AccountsService {
       .select("*")
       .eq("user_id", OWNER_ID)
       .order("created_at", { ascending: false });
-    return { ok: true, accounts };
+    return { ok: true, accounts, queuedAffected };
   }
 
   // POST /api/accounts/disconnect — remove every Page connected via one FB account.

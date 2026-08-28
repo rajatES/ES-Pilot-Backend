@@ -25,6 +25,8 @@ import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
 import { runCompliance } from "../../lib/compliance";
 import {
   assertPublishable,
+  isLocked,
+  lockedAccountNames,
   postForPlatform,
   platformOptions,
   fbFormat,
@@ -259,6 +261,17 @@ export class PostsService {
 
     if (accountsError || !accounts?.length) {
       throw new NotFoundException("Selected accounts were not found.");
+    }
+
+    // One of the targets is a locked page. assertPublishable would catch it at
+    // send time, but that means accepting the post, creating its targets and
+    // failing them one by one — so refuse here, where the author can still
+    // deselect. Drafts are unaffected: that branch returns above.
+    const locked = lockedAccountNames(accounts);
+    if (locked.length) {
+      throw new BadRequestException(
+        `${locked.join(", ")} ${locked.length === 1 ? "is" : "are"} locked — deselect ${locked.length === 1 ? "it" : "them"} to continue.`,
+      );
     }
 
     // Instagram cannot publish text-only posts — catch it up front instead of
@@ -650,7 +663,7 @@ export class PostsService {
 
     const { data: post, error } = await supabase
       .from("scheduled_posts")
-      .select("*, post_targets(social_account_id, platform)")
+      .select("*, post_targets(social_account_id, platform, social_accounts(id, display_name, posting_locked))")
       .eq("id", postId)
       .eq("user_id", OWNER_ID)
       .maybeSingle();
@@ -688,7 +701,17 @@ export class PostsService {
       .single();
     if (cloneError) throw new InternalServerErrorException(cloneError.message);
 
-    const targets = (post.post_targets || []).map((t) => ({
+    // Drop targets whose page has since been locked. Copying them would queue
+    // a post that can only fail at send time, and the original post predates
+    // the lock — so the honest clone is the un-locked subset.
+    const liveTargets = (post.post_targets || []).filter((t: any) => !isLocked(t.social_accounts));
+    const skipped = (post.post_targets || []).length - liveTargets.length;
+    if (!liveTargets.length) {
+      await supabase.from("scheduled_posts").delete().eq("id", clone.id);
+      throw new BadRequestException("Every page on that post is locked — nothing to recycle.");
+    }
+
+    const targets = liveTargets.map((t: any) => ({
       post_id: clone.id,
       social_account_id: t.social_account_id,
       platform: t.platform,
@@ -704,7 +727,9 @@ export class PostsService {
 
     await logActivity({
       type: "post.recycled",
-      title: `Recycled a post for ${when.toLocaleString()}`,
+      title: skipped
+        ? `Recycled a post for ${when.toLocaleString()} — skipped ${skipped} locked page(s)`
+        : `Recycled a post for ${when.toLocaleString()}`,
       status: "info",
       meta: { sourcePostId: post.id, newPostId: clone.id },
     });
@@ -726,7 +751,7 @@ export class PostsService {
 
     const { data: accounts, error: acctError } = await supabase
       .from("social_accounts")
-      .select("id, platform, display_name")
+      .select("id, platform, display_name, posting_locked")
       .eq("user_id", OWNER_ID);
     if (acctError) throw new InternalServerErrorException(acctError.message);
     const byName = new Map((accounts || []).map((a) => [a.display_name.trim().toLowerCase(), a]));
@@ -755,17 +780,27 @@ export class PostsService {
       const pagesField = (row.pages || "").trim();
       let targets;
       if (!pagesField || pagesField.toLowerCase() === "all") {
-        targets = accounts || [];
+        // "all" means every page we can actually post to — locked pages are
+        // silently out, exactly as they are for the composer's "Select all".
+        targets = (accounts || []).filter((a: any) => !isLocked(a));
       } else {
         targets = [];
         const misses: string[] = [];
+        const locked: string[] = [];
         for (const name of pagesField.split(/[;,]/).map((s) => s.trim()).filter(Boolean)) {
-          const acct = byName.get(name.toLowerCase());
-          if (acct) targets.push(acct);
-          else misses.push(name);
+          const acct: any = byName.get(name.toLowerCase());
+          if (!acct) misses.push(name);
+          else if (isLocked(acct)) locked.push(acct.display_name);
+          else targets.push(acct);
         }
         if (misses.length) {
           errors.push({ row: rowNum, error: `Unknown page(s): ${misses.join(", ")}` });
+          continue;
+        }
+        // Named explicitly, so say so rather than quietly dropping it — the
+        // importer asked for this page by name.
+        if (locked.length) {
+          errors.push({ row: rowNum, error: `Locked page(s): ${locked.join(", ")} — unlock or remove them.` });
           continue;
         }
       }

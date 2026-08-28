@@ -6,10 +6,10 @@ import { CurrentProfile } from "../../auth/current-user.decorator";
 export class AccountsController {
   constructor(private readonly accounts: AccountsService) {}
 
-  // POST /api/accounts/bulk — category change or disconnect for many accounts.
+  // POST /api/accounts/bulk — category, lock/unlock, or disconnect for many.
   @Post("bulk")
-  bulk(@Body() body: any) {
-    return this.accounts.bulk(body);
+  bulk(@Body() body: any, @CurrentProfile() profile: any) {
+    return this.accounts.bulk(body, profile);
   }
 
   // POST /api/accounts/disconnect — remove all Pages connected via one FB account.
@@ -24,10 +24,11 @@ export class AccountsController {
     return this.accounts.sync(body);
   }
 
-  // PATCH /api/accounts/:id — manual category override.
+  // PATCH /api/accounts/:id — manual category override, and { locked } to lock
+  // or unlock the page (stops posting without disconnecting it).
   @Patch(":id")
-  updateCategory(@Param("id") id: string, @Body() body: any) {
-    return this.accounts.updateCategory(id, body?.category);
+  update(@Param("id") id: string, @Body() body: any, @CurrentProfile() profile: any) {
+    return this.accounts.update(id, body, profile);
   }
 
   // DELETE /api/accounts/:id

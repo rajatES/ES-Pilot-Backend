@@ -211,6 +211,20 @@ export class SocialAccount {
   @Column({ name: "publishing_ok", default: true })
   publishing_ok: boolean;
 
+  // Page lock — an admin has deliberately stopped this account from being
+  // posted to. Distinct from `publishing_ok`, which is an automatic HEALTH
+  // signal (a revoked token, a failed CREATE_CONTENT probe) that
+  // /api/accounts/sync and a successful publish both reset to true. A policy
+  // decision must survive those resets, so it needs its own column.
+  //
+  // A locked account is NOT disconnected: it keeps its token, its follower
+  // history, its insights and every past post, and the token-refresh cron
+  // keeps it alive. Only outbound publishing is refused. It also survives a
+  // reconnect — every connect path upserts a fixed column list that doesn't
+  // include this one, so re-granting access can't quietly unlock a page.
+  @Column({ name: "posting_locked", default: false })
+  posting_locked: boolean;
+
   @Column({ name: "last_synced_at", type: "timestamptz", nullable: true })
   last_synced_at: Date | null;
 

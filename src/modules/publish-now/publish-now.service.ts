@@ -10,6 +10,7 @@ import { runCompliance } from "../../lib/compliance";
 import { noteAccountPublishFailure, clearAccountPublishFailure } from "../../lib/accountHealth";
 import {
   assertPublishable,
+  lockedAccountNames,
   postForPlatform,
   platformOptions,
   fbFormat,
@@ -67,6 +68,16 @@ export class PublishNowService {
 
     if (accountsError || !accounts?.length) {
       throw new NotFoundException("Selected accounts not found.");
+    }
+
+    // A locked page among the targets — refuse before anything is written, so
+    // no half-published scheduled_posts row is left behind. (assertPublishable
+    // below is the backstop for targets that slip through another path.)
+    const locked = lockedAccountNames(accounts);
+    if (locked.length) {
+      throw new BadRequestException(
+        `${locked.join(", ")} ${locked.length === 1 ? "is" : "are"} locked — deselect ${locked.length === 1 ? "it" : "them"} to continue.`,
+      );
     }
 
     if (!mediaList.length && accounts.some((a) => a.platform === "instagram")) {

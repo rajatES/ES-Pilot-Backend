@@ -26,12 +26,34 @@ const NATIVE_PLATFORMS = ["facebook", "instagram", "youtube"];
 // error instead — the target fails with a message that says what to do.
 export function assertPublishable(account) {
   if (!account?.platform) throw new Error("This account has no platform set.");
+  if (isLocked(account)) throw new Error(lockedMessage(account));
   if (account.publish_via === "postiz") return;
   if (NATIVE_PLATFORMS.includes(account.platform)) return;
   throw new Error(
     `${account.display_name || account.platform} can't publish: ${account.platform} now publishes through Postiz. ` +
       `Re-import this account from Accounts → Connect → Import from Postiz.`,
   );
+}
+
+// An admin has locked this page (social_accounts.posting_locked). Not a health
+// problem and not a disconnect: the token, insights, follower history and past
+// posts all stay. Only outbound publishing is refused.
+export function isLocked(account) {
+  return account?.posting_locked === true;
+}
+
+export function lockedMessage(account) {
+  return (
+    `${account?.display_name || "This page"} is locked — posting to it is turned off. ` +
+    `An admin can unlock it in Accounts → Manage.`
+  );
+}
+
+// Names of the selected accounts that are locked — used by the schedule /
+// publish-now / API entry points to refuse UP FRONT with one clear message,
+// instead of accepting the post and failing each target at send time.
+export function lockedAccountNames(accounts) {
+  return (accounts || []).filter(isLocked).map((a) => a.display_name || a.platform);
 }
 
 // Caption for a platform: trimmed override, else the master body.

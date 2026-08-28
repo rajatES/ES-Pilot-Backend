@@ -233,13 +233,14 @@ export class PublicApiService {
   // one is `publishing_ok`: a page whose token was revoked or whose permissions
   // lapsed is marked not-ok, and an automation must skip it rather than
   // discovering it at publish time. Token expiry counts too — a long-lived page
-  // token with a past `token_expires_at` cannot publish either.
+  // token with a past `token_expires_at` cannot publish either — and neither can
+  // a page an admin has LOCKED (`posting_locked`) in the app.
   async listAccounts(query: any = {}) {
     const db = this.supabaseService.createServiceClient();
     const { data, error } = await db
       .from("social_accounts")
       .select(
-        "id, platform, display_name, external_account_id, publish_via, publishing_ok, token_expires_at, category, metadata, created_at",
+        "id, platform, display_name, external_account_id, publish_via, publishing_ok, posting_locked, token_expires_at, category, metadata, created_at",
       )
       .eq("user_id", OWNER_ID)
       .order("created_at", { ascending: false });
@@ -278,8 +279,13 @@ export class PublicApiService {
         platform: a.platform,
         name: a.display_name,
         externalAccountId: a.external_account_id,
-        status: a.publishing_ok === false || expired ? "blocked" : "active",
+        status: a.publishing_ok === false || a.posting_locked === true || expired ? "blocked" : "active",
         publishingOk: a.publishing_ok !== false,
+        // Locked by an admin in the app (Accounts → Manage), as opposed to
+        // broken. An automation should skip these the same way it skips an
+        // unhealthy page — POST /v1/posts refuses them — but the distinction
+        // matters: nobody needs to go reconnect anything.
+        locked: a.posting_locked === true,
         // Which pipeline publishes here: "native" (our own platform app) or
         // "postiz" (relayed through the Postiz workspace — Threads, personal
         // Instagram). Additive field; callers that ignore it are unaffected.

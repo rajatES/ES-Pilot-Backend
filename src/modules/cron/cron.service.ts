@@ -8,7 +8,7 @@ import { publishPostizPost, reconcilePostizTarget, getPostizPostMetrics } from "
 import { publishYouTubeVideo, checkYouTubeVideoStatus, getYouTubeVideoAnalytics } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
-import { assertPublishable, postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
+import { assertPublishable, isLocked, postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
 import { buildPostInsightRow } from "../../lib/postInsightRow";
 import { noteAccountPublishFailure, clearAccountPublishFailure } from "../../lib/accountHealth";
 import { ApprovalsService } from "../approvals/approvals.service";
@@ -624,7 +624,7 @@ export class CronService {
         for (const [postId, score] of ranked) {
           const { data: post } = await supabase
             .from("scheduled_posts")
-            .select("*, post_targets(social_account_id, platform)")
+            .select("*, post_targets(social_account_id, platform, social_accounts(id, display_name, posting_locked))")
             .eq("id", postId)
             .maybeSingle();
           if (!post || post.status !== "sent") continue;
@@ -638,6 +638,13 @@ export class CronService {
             .gte("created_at", new Date(Date.now() - 7 * 86400000).toISOString())
             .limit(1);
           if (dupe?.length) continue;
+
+          // A page locked since the original post went out must not be
+          // re-targeted by the unattended recycler. Resolved BEFORE the clone
+          // is written, so an all-locked post is skipped for the next-ranked
+          // one instead of leaving behind an empty scheduled_posts row.
+          const liveTargets = (post.post_targets || []).filter((t: any) => !isLocked(t.social_accounts));
+          if (!liveTargets.length) continue;
 
           const when = new Date(Date.now() + 86400000);
           when.setMinutes(0, 0, 0);
@@ -657,7 +664,7 @@ export class CronService {
           if (cloneError) break;
 
           await supabase.from("post_targets").insert(
-            (post.post_targets || []).map((t) => ({
+            liveTargets.map((t: any) => ({
               post_id: clone.id,
               social_account_id: t.social_account_id,
               platform: t.platform,
