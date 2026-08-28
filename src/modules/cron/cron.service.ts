@@ -25,6 +25,12 @@ import { SocialSyncService } from "../insights/social-sync.service";
 // see the 429 note in HANDOFF §5 before raising it further.
 const PUBLISH_BATCH_SIZE = 50;
 
+// How long a target may sit at "publishing" before it is treated as stranded.
+// Two hours matches the post-level sweep below and is far beyond any real
+// attempt (every platform call has its own timeout in the low minutes), so it
+// can never race a publish that is still in flight.
+const STRANDED_TARGET_MS = 2 * 60 * 60 * 1000;
+
 // Cap on the target lookup that decides WHICH posts have publishable work.
 // Purely a runaway guard — a queue of this many unpublished targets is its own
 // incident, not something to page through.
@@ -156,10 +162,84 @@ export class CronService {
     throw new UnauthorizedException("Unauthorized.");
   }
 
+  // Recompute a post's status from its targets. Shared by the publish loop and
+  // the stranded-target sweep so the two can't drift — they answer the same
+  // question ("what is this post now?") and a second copy of this ternary would
+  // be exactly the kind of drift that hides a status bug.
+  private async refreshPostStatus(supabase: any, postId: string) {
+    const { data: fresh } = await supabase.from("post_targets").select("status").eq("post_id", postId);
+    const statuses = (fresh || []).map((t: any) => t.status);
+    const newStatus = statuses.includes("pending_review")
+      ? "pending_review"
+      : statuses.some((st: string) => st === "sent" || st === "scheduled")
+        ? statuses.includes("scheduled")
+          ? "scheduled"
+          : "sent"
+        : "failed";
+    await supabase
+      .from("scheduled_posts")
+      .update({ status: newStatus, sent_at: newStatus === "sent" ? new Date().toISOString() : null })
+      .eq("id", postId);
+    return newStatus;
+  }
+
+  // See the call site in publish() for why these are failed rather than retried.
+  private async sweepStrandedTargets(supabase: any) {
+    const cutoff = new Date(Date.now() - STRANDED_TARGET_MS).toISOString();
+    const { data: stranded, error } = await supabase
+      .from("post_targets")
+      .update({
+        status: "failed",
+        last_error:
+          "Publishing was interrupted before this page reported back (usually a backend restart mid-publish). " +
+          "It may or may not have reached the platform — check the page before reposting.",
+      })
+      .eq("status", "publishing")
+      .is("external_post_id", null)
+      .lt("created_at", cutoff);
+
+    if (error || !stranded?.length) return 0;
+
+    for (const postId of [...new Set(stranded.map((t: any) => t.post_id))]) {
+      await this.refreshPostStatus(supabase, postId as string);
+    }
+
+    console.warn(`[cron] ${stranded.length} target(s) were stranded mid-publish and have been marked failed.`);
+    await logActivity({
+      type: "post.failed",
+      title: `${stranded.length} post target(s) were stranded mid-publish`,
+      status: "error",
+      meta: {
+        targetIds: stranded.map((t: any) => t.id),
+        note: "Interrupted before the platform reported back — verify the page before reposting.",
+      },
+    });
+    return stranded.length;
+  }
+
   // Queue publisher — publishes due targets the FB native scheduler isn't handling.
   async publish(req: any) {
     this.authorize(req);
     const supabase = this.supabaseService.createServiceClient();
+
+    // Targets stranded mid-publish, swept BEFORE anything else so a stranded
+    // target can't keep its post invisible for another run.
+    //
+    // publish-now and the composer's "publish now" insert a target as
+    // "publishing" and flip it to sent/failed when the attempt finishes. A
+    // process that dies in between — a deploy rebuild is the usual way — leaves
+    // the target at "publishing" with no external_post_id, and NOTHING recovers
+    // it: the ready-target query below only looks for "scheduled", and the
+    // post-level stale sweep is scoped to posts that already own a ready
+    // target, which this post by definition does not. So it sat there forever,
+    // never published, never failed, with nothing in the UI to say so. That is
+    // the "it was scheduled but it never went out and there's no error" report.
+    //
+    // Marked FAILED rather than requeued, deliberately: at the moment the
+    // process died the platform may ALREADY have accepted the post, so a blind
+    // retry risks double-posting to a live page. A visible failure lets a human
+    // check the page and repost; a duplicate can't be taken back.
+    await this.sweepStrandedTargets(supabase);
 
     // Which posts actually have work? Ask the TARGETS first.
     //
@@ -320,21 +400,9 @@ export class CronService {
         }
       }
 
-      const { data: fresh } = await supabase.from("post_targets").select("status").eq("post_id", post.id);
-      const statuses = (fresh || []).map((t) => t.status);
       // Keep the post in review while any page still awaits approval — only the
       // approved pages just published above; the rest stay pending.
-      const newStatus = statuses.includes("pending_review")
-        ? "pending_review"
-        : statuses.some((s) => s === "sent" || s === "scheduled")
-          ? statuses.includes("scheduled")
-            ? "scheduled"
-            : "sent"
-          : "failed";
-      await supabase
-        .from("scheduled_posts")
-        .update({ status: newStatus, sent_at: newStatus === "sent" ? new Date().toISOString() : null })
-        .eq("id", post.id);
+      const newStatus = await this.refreshPostStatus(supabase, post.id);
 
       if (newStatus === "sent") {
         await logActivity({
