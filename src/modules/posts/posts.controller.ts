@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post } from "@nestjs/common";
+import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Query } from "@nestjs/common";
 import { PostsService } from "./posts.service";
 import { CurrentProfile } from "../../auth/current-user.decorator";
 
@@ -10,6 +10,14 @@ export class PostsController {
   @Get()
   list() {
     return this.posts.list();
+  }
+
+  // GET /api/posts/failures — every failed delivery in the window, one row per
+  // failed channel. Declared before any @Get(":id") route would be, so the
+  // literal path can never be swallowed as an id.
+  @Get("failures")
+  failures(@Query() query: any) {
+    return this.posts.failures(query);
   }
 
   // POST /api/posts — create a draft/review, or schedule/publish to each Page.

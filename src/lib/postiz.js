@@ -30,6 +30,7 @@
 // API reference: https://docs.postiz.com/public-api/introduction
 
 import { createServiceSupabase } from "./supabaseServer";
+import { logActivity } from "./activity";
 
 const DEFAULT_BASE = "https://api.postiz.com/public/v1";
 
@@ -395,22 +396,45 @@ export async function dryRunPostizChannel({ account, mediaUrl = null, keepDraft 
 
 // ── Status ───────────────────────────────────────────────────────────────
 
+// Page sizes a paginated list endpoint typically caps at. Postiz's /posts is
+// documented as a plain date-windowed list with no page/limit parameters, so we
+// cannot ask for the next page — the only defence is to NOTICE a result whose
+// size is suspiciously round and refuse to conclude anything from it.
+const COMMON_PAGE_SIZES = new Set([10, 20, 25, 50, 100, 200]);
+
 // Postiz exposes no get-post-by-id, only a date-windowed list — so look the
 // post up in a window around when we sent it.
 //
-// Returns { found, state, permalink, error }. Deliberately NOT the { exists }
-// contract the native libs use: a post missing from Postiz means it was deleted
-// *in Postiz*, which says nothing about whether it is still live on Threads or
-// Instagram. Treating that as "deleted on platform" would invent deletions —
-// the same false-positive class that bit auto-optimized Facebook reels. Callers
-// use this for the permalink and to notice state === "ERROR".
+// Returns { found, state, permalink, error }, where `found` is deliberately
+// THREE-valued:
+//   true   — Postiz returned the post; `state`/`permalink` are meaningful.
+//   false  — the listing came back healthy and our id was not in it.
+//   null   — INCONCLUSIVE: the call failed, or the listing looks truncated.
+//
+// The null case is the one that matters. A truncated page turns a live post
+// into "not in the listing", and the old code could not tell that apart from a
+// real absence — it just stamped last_verified_at and moved on, which is how a
+// failed Threads post could sit as "sent" forever with nothing logged.
+//
+// This is also deliberately NOT the { exists } contract the native libs use: a
+// post missing from Postiz means it was deleted *in Postiz*, which says nothing
+// about whether it is still live on Threads or Instagram. Treating that as
+// "deleted on platform" would invent deletions — the same false-positive class
+// that bit auto-optimized Facebook reels. Callers use this for the permalink
+// and to notice state === "ERROR".
 export async function getPostizPostState({ externalPostId, sentAt }) {
   if (isMockMode() || String(externalPostId).includes("_mock_")) {
     return { found: true, state: "PUBLISHED", permalink: null, error: null };
   }
 
   const anchor = sentAt ? new Date(sentAt).getTime() : Date.now();
-  const pad = 2 * 86400000; // ±2 days covers clock skew and late publishes
+  // ±12h, narrowed from ±2 days on 2026-09-09. Every post we create is
+  // type:"now", so its publishDate is within minutes of sent_at; the old
+  // 4-day window returned four days of the WHOLE workspace's posts (27 Threads
+  // channels plus X) for every single lookup, which is exactly how the listing
+  // got big enough to truncate. 12h still absorbs clock skew and a slow Postiz
+  // queue by a wide margin.
+  const pad = 12 * 3600000;
   const params = new URLSearchParams({
     startDate: new Date(anchor - pad).toISOString(),
     endDate: new Date(anchor + pad).toISOString(),
@@ -425,7 +449,17 @@ export async function getPostizPostState({ externalPostId, sentAt }) {
 
   const posts = Array.isArray(data) ? data : data?.posts || [];
   const match = posts.find((p) => String(p?.id) === String(externalPostId));
-  if (!match) return { found: false, state: null, permalink: null, error: null };
+  if (!match) {
+    if (COMMON_PAGE_SIZES.has(posts.length)) {
+      return {
+        found: null,
+        state: null,
+        permalink: null,
+        error: `Postiz returned exactly ${posts.length} posts for the window — the listing is probably truncated, so this post's absence proves nothing.`,
+      };
+    }
+    return { found: false, state: null, permalink: null, error: null };
+  }
 
   return {
     found: true,
@@ -435,6 +469,30 @@ export async function getPostizPostState({ externalPostId, sentAt }) {
   };
 }
 
+// Roll a post's status down to "failed" once NO target is still viable.
+//
+// Not cron's refreshPostStatus, on purpose. That one also rewrites sent_at
+// (nulling it, or stamping it to now()), which is right at publish time and
+// wrong here: this runs hours later against a post whose sent_at is a real
+// historical publish moment, and moving it would both falsify the timeline and
+// slide the post in or out of the verify sweep's 24h window. It also lives in a
+// Nest service this lib can't import. So: status only, and only downward.
+//
+// A partial failure deliberately leaves the post alone — it DID publish
+// somewhere, so calling the whole post failed would be a lie. The per-target
+// status is what the UI reads for that case (PostsView's Error tab and
+// PostCard both key off post_targets, not post.status).
+async function demotePostIfNothingSurvived(supabase, postId) {
+  if (!postId) return false;
+  const { data: siblings } = await supabase.from("post_targets").select("status").eq("post_id", postId);
+  const viable = (siblings || []).some((t) =>
+    ["sent", "scheduled", "publishing", "pending_review"].includes(t.status),
+  );
+  if (viable) return false;
+  await supabase.from("scheduled_posts").update({ status: "failed" }).eq("id", postId);
+  return true;
+}
+
 // Reconcile one postiz-backed post_target against Postiz. Called from both
 // verify paths (the manual POST /api/posts/verify and the verify-posts cron) so
 // they can't drift, and best-effort throughout: a Postiz outage must not break
@@ -442,8 +500,13 @@ export async function getPostizPostState({ externalPostId, sentAt }) {
 //
 // What it does: records the permalink once Postiz publishes (which is often a
 // little after we got the post id back), and turns a Postiz-side ERROR into a
-// failed target so it stops showing as delivered. What it deliberately does NOT
-// do is mark anything deleted — see getPostizPostState.
+// failed target — with an activity entry and, when the post has nothing left
+// standing, a post-level "failed" — so it stops showing as delivered and starts
+// showing up in the Error tab. What it deliberately does NOT do is mark anything
+// deleted — see getPostizPostState.
+//
+// Returns { failed, permalink, conclusive }. `conclusive: false` means we
+// learned nothing and the caller must NOT treat the target as verified.
 export async function reconcilePostizTarget(target) {
   try {
     const state = await getPostizPostState({
@@ -451,20 +514,160 @@ export async function reconcilePostizTarget(target) {
       sentAt: target.sent_at,
     });
 
+    const supabase = createServiceSupabase();
+
+    // Inconclusive: a Postiz outage, or a listing we can't trust. Crucially do
+    // NOT stamp last_verified_at — that column is the caller's "already checked,
+    // skip for 3h" gate, and burning it on a check that answered nothing is how
+    // a real failure went unseen for the whole 24h verify window.
+    if (state.found === null) {
+      console.warn(
+        `[postiz] inconclusive state check for target ${target.id} (post ${target.post_id || "?"}): ${state.error}`,
+      );
+      return { failed: false, permalink: null, conclusive: false };
+    }
+
     const patch = { last_verified_at: new Date().toISOString() };
     if (state.permalink && state.permalink !== target.permalink) patch.permalink = state.permalink;
-    if (state.state === "ERROR") {
+
+    const failed = state.state === "ERROR";
+    if (failed) {
       patch.status = "failed";
       patch.last_error = state.error;
     }
 
-    const supabase = createServiceSupabase();
     await supabase.from("post_targets").update(patch).eq("id", target.id);
-    return { failed: state.state === "ERROR", permalink: patch.permalink || null };
+
+    if (failed) {
+      // Postiz said 201 at publish time, so this target has been sitting in the
+      // app as "sent". Nothing else would ever have told anyone otherwise —
+      // hence the activity entry (which logActivity mirrors into notifications
+      // for error/warning) as well as the status flip.
+      const wholePostFailed = await demotePostIfNothingSurvived(supabase, target.post_id);
+      await logActivity({
+        type: "post.failed",
+        title: `Postiz reported a failed publish — ${target.social_accounts?.display_name || "a Postiz channel"}`,
+        status: "error",
+        meta: {
+          postId: target.post_id || null,
+          targetId: target.id,
+          platform: target.social_accounts?.platform || target.platform || null,
+          externalPostId: target.external_post_id,
+          error: state.error,
+          wholePostFailed,
+          note: "Accepted by Postiz, then rejected by the platform — detected on verify, not at publish time.",
+        },
+      });
+    }
+
+    return { failed, permalink: patch.permalink || null, conclusive: true };
   } catch (e) {
     console.warn(`[postiz] reconcile failed for target ${target.id}:`, e.message);
-    return { failed: false, permalink: null };
+    return { failed: false, permalink: null, conclusive: false };
   }
+}
+
+// ── Channel health ───────────────────────────────────────────────────────
+
+// Reconcile our postiz-backed accounts against the Postiz workspace, and flag
+// the ones that cannot publish at all.
+//
+// This is the whole-channel counterpart to reconcilePostizTarget's per-post
+// check, and it catches a failure mode that per-post reconciling can only ever
+// report one post at a time:
+//
+//   - **disabled in Postiz** — a channel whose platform authorization Postiz
+//     has lost (Threads tokens expire; the workspace showed 2 of 27 Threads
+//     channels disabled as of 2026-08-21). Postiz still ACCEPTS a create-post
+//     for it, so our publish call returns 201 and we mark the target "sent";
+//     the publish then fails inside Postiz. Every post to that channel fails
+//     this way, indefinitely, while Accounts showed it as healthy.
+//   - **gone from Postiz** — the channel was removed or re-added there, so our
+//     stored integration id points at nothing and needs a re-import.
+//
+// One `GET /integrations` call for the whole workspace, so it is cheap enough
+// to run on every verify sweep. Uses the same publishing_ok / auth_error pair
+// the Meta paths use, so the existing "reconnect this page" UI covers it with
+// no new frontend concept. Best-effort: a Postiz outage returns zeroes rather
+// than breaking a verify sweep that is mostly about Facebook.
+export async function syncPostizChannelHealth() {
+  if (!postizConfigured() || isMockMode()) return { checked: 0, flagged: 0, cleared: 0 };
+
+  let channels;
+  try {
+    // Deliberately the RAW listing, not listPostizIntegrations(): that one
+    // filters to supported providers, so a channel whose provider we no longer
+    // recognise would look "gone from Postiz" instead of what it is.
+    const data = await postizFetch("/integrations");
+    channels = Array.isArray(data) ? data : data?.integrations || [];
+  } catch (e) {
+    console.warn("[postiz] channel-health check skipped:", e.message);
+    return { checked: 0, flagged: 0, cleared: 0, error: e.message };
+  }
+
+  const byId = new Map(channels.filter((c) => c?.id).map((c) => [String(c.id), c]));
+
+  const supabase = createServiceSupabase();
+  const { data: accounts } = await supabase
+    .from("social_accounts")
+    .select("id, display_name, platform, external_account_id, publishing_ok, metadata")
+    .eq("publish_via", "postiz");
+
+  let flagged = 0,
+    cleared = 0;
+
+  for (const account of accounts || []) {
+    const channel = byId.get(String(account.external_account_id));
+    const reason = !channel
+      ? `${account.display_name} is no longer in the Postiz workspace — its integration id is stale. Re-import it from Accounts → Connect → Import from Postiz.`
+      : channel.disabled
+        ? `${account.display_name} is disabled in Postiz — Postiz will accept posts for it and then fail to publish them. Re-authorize the channel inside Postiz.`
+        : null;
+
+    const previous = account.metadata?.auth_error?.message || null;
+
+    if (reason) {
+      // Only write on a change, so this doesn't rewrite 27 rows every 5 minutes
+      // and doesn't re-announce the same dead channel on every sweep.
+      if (account.publishing_ok === false && previous === reason) continue;
+      await supabase
+        .from("social_accounts")
+        .update({
+          publishing_ok: false,
+          metadata: {
+            ...(account.metadata || {}),
+            auth_error: { message: reason, at: new Date().toISOString() },
+          },
+        })
+        .eq("id", account.id);
+      flagged++;
+      await logActivity({
+        type: "account.publish_blocked",
+        title: `${account.display_name} can't publish through Postiz`,
+        status: "error",
+        meta: { accountId: account.id, platform: account.platform, reason },
+      });
+      continue;
+    }
+
+    // Healthy again — clear only a flag THIS check raised. A publish failure
+    // flagged by noteAccountPublishFailure is about something else and must not
+    // be cleared just because the channel is enabled in Postiz.
+    if (previous && /(no longer in the Postiz workspace|disabled in Postiz)/.test(previous)) {
+      const metadata = { ...(account.metadata || {}) };
+      delete metadata.auth_error;
+      await supabase
+        .from("social_accounts")
+        .update({ publishing_ok: true, metadata })
+        .eq("id", account.id);
+      cleared++;
+    }
+  }
+
+  if (flagged || cleared) {
+    console.warn(`[postiz] channel health: ${flagged} flagged, ${cleared} cleared.`);
+  }
+  return { checked: (accounts || []).length, flagged, cleared };
 }
 
 // ── Metrics ──────────────────────────────────────────────────────────────

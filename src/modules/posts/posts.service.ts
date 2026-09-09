@@ -51,6 +51,16 @@ import { noteAccountPublishFailure, clearAccountPublishFailure } from "../../lib
 const INSTANT_WINDOW_MS = 10 * 60 * 1000;
 const MAX_SCHEDULE_MS = 30 * 24 * 60 * 60 * 1000;
 
+// How far back the Error tab reaches by default, and the row cap that keeps one
+// bad week from returning an unbounded result. 90 days is long enough to cover
+// "did that campaign actually go out?" and short enough that the query stays a
+// simple indexed scan on post_targets.status + created_at. Callers can narrow
+// it with ?days=N; the response reports `truncated` so the UI can say so rather
+// than quietly showing a partial list — the failure this whole endpoint exists
+// to stop repeating.
+const FAILURE_WINDOW_DAYS = 90;
+const FAILURE_LIMIT = 1000;
+
 @Injectable()
 export class PostsService {
   constructor(
@@ -97,6 +107,125 @@ export class PostsService {
     }));
 
     return { accounts, posts, authors: authors || [], apiKeys };
+  }
+
+  // GET /api/posts/failures — every failed delivery in the window, one row per
+  // failed channel.
+  //
+  // A separate endpoint rather than a filter over list(), for two reasons the
+  // Error tab could not work around:
+  //
+  //  1. list() is capped at the 100 most recent posts by scheduled_for. At ES's
+  //     volume that is a few days, so a failure older than that was invisible in
+  //     the UI no matter what the tab filtered on. Raising the cap would make
+  //     EVERY tab pay for it.
+  //  2. The unit of failure is the CHANNEL, not the post. A post fanned out to
+  //     56 Threads channels that failed on one of them is not a failed post —
+  //     post.status is legitimately "sent" — so nothing post-shaped can
+  //     represent it. Asking post_targets directly does.
+  //
+  // "Regardless of the reason" is meant literally: this does not care whether
+  // the failure came from the publish cron, publish-now, an approval publish, a
+  // locked page, a stranded-target sweep, or the Postiz verify reconcile. It
+  // reads the recorded outcome, so a failure mode added later is included
+  // without touching this.
+  async failures(query: any = {}) {
+    const supabase = this.supabaseService.createServiceClient();
+
+    const days = Math.min(Math.max(Number(query?.days) || FAILURE_WINDOW_DAYS, 1), 365);
+    const since = new Date(Date.now() - days * 86400000).toISOString();
+
+    const [{ data: targets, error: targetError }, { data: posts, error: postError }] = await Promise.all([
+      // Failed targets. Filtered on the target's own created_at because the pg
+      // shim cannot filter on an embedded table — a target is always created
+      // with its post, so this is the post's age too.
+      supabase
+        .from("post_targets")
+        .select("*, scheduled_posts(*), social_accounts(id, display_name, platform, avatar_url, publish_via)")
+        .eq("status", "failed")
+        .gte("created_at", since)
+        .order("created_at", { ascending: false })
+        .limit(FAILURE_LIMIT),
+      // Posts that failed WITHOUT leaving a failed target behind. Rare but real:
+      // publish-now marks the post failed if it could not even insert the
+      // target row, and there is then no per-channel row to report. Without
+      // this those failures would be the one class still missing.
+      supabase
+        .from("scheduled_posts")
+        .select("*, post_targets(id, status)")
+        .eq("user_id", OWNER_ID)
+        .eq("status", "failed")
+        .gte("scheduled_for", since)
+        .order("scheduled_for", { ascending: false })
+        .limit(FAILURE_LIMIT),
+    ]);
+
+    if (targetError || postError) {
+      throw new InternalServerErrorException(targetError?.message || postError?.message);
+    }
+
+    const rows = (targets || [])
+      // A target whose post is gone (hard-deleted) has nothing to show or open.
+      .filter((t: any) => t.scheduled_posts && t.scheduled_posts.user_id === OWNER_ID)
+      .map((t: any) => this.failureRow(t));
+
+    const covered = new Set(rows.map((r: any) => r.postId));
+    for (const post of posts || []) {
+      if (covered.has(post.id)) continue;
+      if ((post.post_targets || []).some((t: any) => t.status === "failed")) continue;
+      rows.push({
+        id: `post:${post.id}`,
+        postId: post.id,
+        targetId: null,
+        // No channel to name — the post failed before it reached one.
+        channel: null,
+        accountId: null,
+        platform: null,
+        avatarUrl: null,
+        publishVia: null,
+        body: post.body || "",
+        createdBy: post.created_by || null,
+        when: post.scheduled_for || post.created_at || null,
+        error: post.last_error || "This post failed before it reached any page.",
+        permalink: null,
+        externalPostId: null,
+        source: post.source || "app",
+      });
+    }
+
+    // Newest first across both sources. Nothing records a "failed at" time —
+    // post_targets has only created_at — so the post's scheduled time is the
+    // ordering key, which is also the timestamp a reader recognises.
+    rows.sort((a: any, b: any) => String(b.when || "").localeCompare(String(a.when || "")));
+
+    return { failures: rows, days, truncated: (targets || []).length >= FAILURE_LIMIT };
+  }
+
+  // One failed target, flattened for the UI. Kept separate so the shape is
+  // defined in exactly one place.
+  private failureRow(target: any) {
+    const post = target.scheduled_posts || {};
+    const account = target.social_accounts || {};
+    return {
+      id: target.id,
+      postId: target.post_id,
+      targetId: target.id,
+      channel: account.display_name || "Unknown channel",
+      accountId: target.social_account_id || account.id || null,
+      platform: account.platform || target.platform || null,
+      avatarUrl: account.avatar_url || null,
+      publishVia: account.publish_via || null,
+      body: post.body || "",
+      createdBy: post.created_by || null,
+      when: post.scheduled_for || target.created_at || null,
+      // Every failure path writes last_error. A blank one still gets a row —
+      // "we don't know why" is information, and swallowing it would recreate
+      // the exact problem this endpoint exists to fix.
+      error: target.last_error || "Failed with no reason recorded.",
+      permalink: target.permalink || null,
+      externalPostId: target.external_post_id || null,
+      source: post.source || "app",
+    };
   }
 
   async create(payload: any, author: any) {
@@ -934,8 +1063,13 @@ export class PostsService {
         // but gives no trustworthy signal that a post was removed on the
         // platform, so they stay exempt from deletion sync.
         if (account.publish_via === "postiz") {
-          await reconcilePostizTarget(target);
-          targetStatuses.push(target.status);
+          checked++;
+          const recon = await reconcilePostizTarget(target);
+          // A Postiz-side ERROR is a real, newly-discovered failure: push the
+          // new status so the roll-up below sees it, rather than the "sent" the
+          // target has been carrying since Postiz returned 201.
+          targetStatuses.push(recon.failed ? "failed" : target.status);
+          if (recon.failed) postChanged = true;
           continue;
         }
 
@@ -1051,6 +1185,7 @@ export class PostsService {
 
       let newStatus = post.status;
       if (targetStatuses.every((s) => s === "deleted")) newStatus = "deleted";
+      else if (targetStatuses.every((s) => s === "failed" || s === "deleted")) newStatus = "failed";
       else if (targetStatuses.every((s) => s === "sent" || s === "deleted")) newStatus = "sent";
       if (newStatus !== post.status) {
         const patch: any = { status: newStatus };

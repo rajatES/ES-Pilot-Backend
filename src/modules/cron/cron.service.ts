@@ -4,7 +4,7 @@ import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { publishFacebookPost, publishFacebookReel, publishFacebookStory, postFacebookComment, checkFacebookPostStatus, getFacebookPostMetrics } from "../../lib/facebook";
 import { publishInstagramPost, postInstagramComment, checkInstagramPostStatus, getInstagramPostMetrics } from "../../lib/instagram";
 import { refreshInstagramToken } from "../../lib/instagramOAuth";
-import { publishPostizPost, reconcilePostizTarget, getPostizPostMetrics } from "../../lib/postiz";
+import { publishPostizPost, reconcilePostizTarget, getPostizPostMetrics, syncPostizChannelHealth } from "../../lib/postiz";
 import { publishYouTubeVideo, checkYouTubeVideoStatus, getYouTubeVideoAnalytics } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
@@ -422,6 +422,14 @@ export class CronService {
     this.authorize(req);
     const supabase = this.supabaseService.createServiceClient();
 
+    // Whole-channel health first: a channel disabled or removed in Postiz fails
+    // EVERY post to it, and Postiz reports that per-post (it accepts the create
+    // and fails later), so without this the per-target loop below would rediscover
+    // the same dead channel one post at a time and never name the actual cause.
+    // One GET for the workspace, and it flips the same publishing_ok /
+    // auth_error pair the Accounts UI already renders as "reconnect".
+    const channelHealth = await syncPostizChannelHealth();
+
     const now = new Date();
     const twentyFourHoursAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
 
@@ -485,8 +493,19 @@ export class CronService {
         // deletions, so they stay exempt from deletion sync.
         if (account.publish_via === "postiz") {
           checked++;
-          await reconcilePostizTarget(target);
-          targetStatuses.push(target.status);
+          const recon = await reconcilePostizTarget(target);
+          if (recon.failed) {
+            // Postiz accepted this post and then the platform rejected it, so
+            // the target has been showing as "sent" since publish time. Feed
+            // the new status into the roll-up below instead of pushing the
+            // stale one, or a post whose only target just failed would stay
+            // "sent" and never reach the Error tab.
+            targetStatuses.push("failed");
+            postChanged = true;
+          } else {
+            if (!recon.conclusive) errors++;
+            targetStatuses.push(target.status);
+          }
           continue;
         }
 
@@ -594,6 +613,12 @@ export class CronService {
       let newStatus = post.status;
       if (targetStatuses.every((s) => s === "deleted")) {
         newStatus = "deleted";
+      } else if (targetStatuses.every((s) => s === "failed" || s === "deleted")) {
+        // Nothing survived. Only reachable now that the Postiz branch above can
+        // turn a "sent" target into a failed one hours after publish; a mixed
+        // post is left alone on purpose, because it really did publish
+        // somewhere and the per-target status carries the rest.
+        newStatus = "failed";
       }
 
       if (newStatus !== post.status) {
@@ -601,7 +626,13 @@ export class CronService {
       }
     }
 
-    return { checked, deleted, errors, message: `Verified ${checked} posts/videos, found ${deleted} deleted.` };
+    return {
+      checked,
+      deleted,
+      errors,
+      postizChannels: channelHealth,
+      message: `Verified ${checked} posts/videos, found ${deleted} deleted.`,
+    };
   }
 
   // Insights sync + optional auto-recycle of the top performer.
