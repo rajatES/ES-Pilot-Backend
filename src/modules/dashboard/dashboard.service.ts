@@ -29,7 +29,11 @@ export class DashboardService {
       supabase
         .from("post_insights")
         .select(
-          "likes, comments, shares, reach, impressions, engagement_rate, fetched_at, post_targets(post_id, social_accounts(display_name), scheduled_posts(id, body, image_url, link_url, sent_at))",
+          // platform / external_post_id / permalink feed the "open the live
+          // post" link on each top-post row (frontend ViewPostLink). The pg
+          // shim ignores this projection and selects *, but the string is the
+          // documented contract for what this query needs.
+          "likes, comments, shares, reach, impressions, engagement_rate, fetched_at, post_targets(post_id, platform, status, external_post_id, permalink, social_accounts(display_name, platform), scheduled_posts(id, body, image_url, link_url, sent_at))",
         )
         .order("fetched_at", { ascending: false })
         .limit(200),
@@ -159,6 +163,13 @@ export class DashboardService {
         reach: 0,
         impressions: 0,
         pages: [],
+        // The first target we can actually link to. A post fans out across many
+        // pages, so there is no single "the" post on the platform — the link is
+        // "see this live somewhere", and the first viewable page answers that.
+        // Deliberately prefers a target that HAS a permalink over one that only
+        // has an id: Instagram/Threads ids resolve to no URL, so taking the
+        // first target blindly would leave a linkable post looking unlinkable.
+        link: null,
       };
       agg.likes += row.likes || 0;
       agg.comments += row.comments || 0;
@@ -166,6 +177,16 @@ export class DashboardService {
       agg.reach += row.reach || 0;
       agg.impressions += row.impressions || 0;
       if (t.social_accounts?.display_name) agg.pages.push(t.social_accounts.display_name);
+
+      const platform = t.social_accounts?.platform || t.platform || null;
+      const candidate =
+        t.status === "sent" && t.external_post_id && !String(t.external_post_id).includes("_mock_")
+          ? { platform, externalPostId: t.external_post_id, permalink: t.permalink || null }
+          : null;
+      if (candidate && (!agg.link || (!agg.link.permalink && candidate.permalink))) {
+        agg.link = candidate;
+      }
+
       postAgg.set(p.id, agg);
     }
     const topPosts = [...postAgg.values()]
