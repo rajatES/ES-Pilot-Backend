@@ -1,6 +1,12 @@
 import { Injectable, InternalServerErrorException } from "@nestjs/common";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 
+// Platforms whose public URL is derivable from the external id alone; the rest
+// (Instagram, Threads) are openable only via a stored permalink. Kept in step
+// with frontend lib/fbLink.js externalPostUrl().
+const ID_DERIVABLE_PLATFORMS = new Set(["facebook", "twitter", "youtube"]);
+const isOpenable = (link: any) => !!link?.permalink || ID_DERIVABLE_PLATFORMS.has(link?.platform);
+
 @Injectable()
 export class DashboardService {
   constructor(private readonly supabaseService: SupabaseService) {}
@@ -165,10 +171,13 @@ export class DashboardService {
         pages: [],
         // The first target we can actually link to. A post fans out across many
         // pages, so there is no single "the" post on the platform — the link is
-        // "see this live somewhere", and the first viewable page answers that.
-        // Deliberately prefers a target that HAS a permalink over one that only
-        // has an id: Instagram/Threads ids resolve to no URL, so taking the
-        // first target blindly would leave a linkable post looking unlinkable.
+        // "see this live somewhere", and the first openable page answers that.
+        //
+        // "Openable" means a URL can be BUILT, which is not the same as having
+        // a permalink: Facebook/X/YouTube resolve from the id alone, while
+        // Instagram/Threads resolve only from a stored permalink. Preferring
+        // "has a permalink" picked the unlinkable Threads page of a
+        // Threads+Facebook post. Mirrors pickViewableTarget in the frontend.
         link: null,
       };
       agg.likes += row.likes || 0;
@@ -183,7 +192,7 @@ export class DashboardService {
         t.status === "sent" && t.external_post_id && !String(t.external_post_id).includes("_mock_")
           ? { platform, externalPostId: t.external_post_id, permalink: t.permalink || null }
           : null;
-      if (candidate && (!agg.link || (!agg.link.permalink && candidate.permalink))) {
+      if (candidate && (!agg.link || (!isOpenable(agg.link) && isOpenable(candidate)))) {
         agg.link = candidate;
       }
 

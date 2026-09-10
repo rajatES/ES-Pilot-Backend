@@ -26,7 +26,10 @@ export class InsightsService {
     const { data: posts, error } = await supabase
       .from("scheduled_posts")
       .select(
-        "id, body, image_url, link_url, media, content_type, sent_at, status, post_targets(id, platform, status, external_post_id, social_accounts(display_name, platform, category))",
+        // permalink feeds the Performance list's "open the live post" link.
+        // Without it a Threads/Instagram row can never be opened: their ids map
+        // to no public URL, so the stored releaseURL is the only source.
+        "id, body, image_url, link_url, media, content_type, sent_at, status, post_targets(id, platform, status, external_post_id, permalink, social_accounts(display_name, platform, category))",
       )
       .eq("user_id", OWNER_ID)
       .eq("status", "sent")
@@ -76,6 +79,7 @@ export class InsightsService {
           // below so dangling targets don't show up as "Unknown".
           page: acct.display_name || null,
           externalPostId: t.external_post_id,
+          permalink: t.permalink || null,
           likes: ins?.likes ?? null,
           comments: ins?.comments ?? null,
           shares: ins?.shares ?? null,
