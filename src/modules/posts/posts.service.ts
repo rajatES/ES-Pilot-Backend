@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   InternalServerErrorException,
   NotFoundException,
@@ -137,29 +138,59 @@ export class PostsService {
     const days = Math.min(Math.max(Number(query?.days) || FAILURE_WINDOW_DAYS, 1), 365);
     const since = new Date(Date.now() - days * 86400000).toISOString();
 
-    const [{ data: targets, error: targetError }, { data: posts, error: postError }] = await Promise.all([
-      // Failed targets. Filtered on the target's own created_at because the pg
-      // shim cannot filter on an embedded table — a target is always created
-      // with its post, so this is the post's age too.
+    // Cleared rows are hidden by DEFAULT but never dropped from the response's
+    // accounting: the count below always reflects them, and ?includeCleared=1
+    // lists them. The rule this protects is the one FailureList.jsx exists for
+    // — the feed must never be able to imply "no failures" when failures exist.
+    const includeCleared = query?.includeCleared === "1" || query?.includeCleared === true;
+
+    // Failed targets. Filtered on the target's own created_at because the pg
+    // shim cannot filter on an embedded table — a target is always created
+    // with its post, so this is the post's age too.
+    let targetQuery = supabase
+      .from("post_targets")
+      .select("*, scheduled_posts(*), social_accounts(id, display_name, platform, avatar_url, publish_via)")
+      .eq("status", "failed")
+      .gte("created_at", since);
+    if (!includeCleared) targetQuery = targetQuery.is("failure_cleared_at", null);
+
+    // Posts that failed WITHOUT leaving a failed target behind. Rare but real:
+    // publish-now marks the post failed if it could not even insert the
+    // target row, and there is then no per-channel row to report. Without
+    // this those failures would be the one class still missing.
+    let postQuery = supabase
+      .from("scheduled_posts")
+      .select("*, post_targets(id, status)")
+      .eq("user_id", OWNER_ID)
+      .eq("status", "failed")
+      .gte("scheduled_for", since);
+    if (!includeCleared) postQuery = postQuery.is("failure_cleared_at", null);
+
+    // The cleared tallies are counted SEPARATELY rather than inferred from the
+    // rows above, because the rows are capped at FAILURE_LIMIT and a count that
+    // silently stopped at the cap is precisely the kind of undercount this feed
+    // must not produce.
+    const [
+      { data: targets, error: targetError },
+      { data: posts, error: postError },
+      { count: clearedTargets, error: clearedTargetError },
+      { count: clearedPosts, error: clearedPostError },
+    ] = await Promise.all([
+      targetQuery.order("created_at", { ascending: false }).limit(FAILURE_LIMIT),
+      postQuery.order("scheduled_for", { ascending: false }).limit(FAILURE_LIMIT),
       supabase
         .from("post_targets")
-        .select("*, scheduled_posts(*), social_accounts(id, display_name, platform, avatar_url, publish_via)")
+        .select("id", { count: "exact", head: true })
         .eq("status", "failed")
         .gte("created_at", since)
-        .order("created_at", { ascending: false })
-        .limit(FAILURE_LIMIT),
-      // Posts that failed WITHOUT leaving a failed target behind. Rare but real:
-      // publish-now marks the post failed if it could not even insert the
-      // target row, and there is then no per-channel row to report. Without
-      // this those failures would be the one class still missing.
+        .not("failure_cleared_at", "is", null),
       supabase
         .from("scheduled_posts")
-        .select("*, post_targets(id, status)")
+        .select("id", { count: "exact", head: true })
         .eq("user_id", OWNER_ID)
         .eq("status", "failed")
         .gte("scheduled_for", since)
-        .order("scheduled_for", { ascending: false })
-        .limit(FAILURE_LIMIT),
+        .not("failure_cleared_at", "is", null),
     ]);
 
     if (targetError || postError) {
@@ -192,6 +223,7 @@ export class PostsService {
         permalink: null,
         externalPostId: null,
         source: post.source || "app",
+        clearedAt: post.failure_cleared_at || null,
       });
     }
 
@@ -200,7 +232,21 @@ export class PostsService {
     // ordering key, which is also the timestamp a reader recognises.
     rows.sort((a: any, b: any) => String(b.when || "").localeCompare(String(a.when || "")));
 
-    return { failures: rows, days, truncated: (targets || []).length >= FAILURE_LIMIT };
+    return {
+      failures: rows,
+      days,
+      truncated: (targets || []).length >= FAILURE_LIMIT,
+      // Always present, whether or not cleared rows were requested — the feed
+      // has to be able to say "and N more are hidden" instead of looking empty.
+      //
+      // NULL, never 0, if the tally itself failed. Reporting "0 hidden" off a
+      // broken count would claim the list is complete when it might not be,
+      // which is the one lie this endpoint must never tell; null lets the UI
+      // say "some may be hidden" instead.
+      cleared:
+        clearedTargetError || clearedPostError ? null : (clearedTargets || 0) + (clearedPosts || 0),
+      includingCleared: includeCleared,
+    };
   }
 
   // One failed target, flattened for the UI. Kept separate so the shape is
@@ -227,6 +273,7 @@ export class PostsService {
       permalink: target.permalink || null,
       externalPostId: target.external_post_id || null,
       source: post.source || "app",
+      clearedAt: target.failure_cleared_at || null,
     };
   }
 
@@ -783,6 +830,100 @@ export class PostsService {
     }
 
     throw new BadRequestException("Unknown action.");
+  }
+
+  // POST /api/posts/failures/clear — tidy the Error tab.
+  //
+  // Clearing HIDES failures from the default feed. It deletes NOTHING: the
+  // target row, its last_error, the post, its analytics and its history are all
+  // untouched, `restore: true` puts them straight back, and a cleared failure
+  // that is later re-sent still publishes normally. The only thing that changes
+  // is whether the row shows up without ?includeCleared=1.
+  //
+  // Gated to admin/Group Head, matching page locking in accounts.service: the
+  // Error tab is shared workspace state, so one person tidying it changes what
+  // everyone else sees, and that is a policy decision rather than a personal
+  // view preference.
+  //
+  // `all` clears the whole window rather than a list. It exists because the
+  // realistic case is "Postiz was down for four minutes and left 200 rows", and
+  // making someone tick 200 boxes would push them toward deleting the posts
+  // instead — which is the destructive thing this feature is meant to prevent.
+  async clearFailures(payload: any, me: any) {
+    if (!me || (me.role !== "admin" && !me.is_group_head)) {
+      throw new ForbiddenException("Only an admin or Group Head can clear the error list.");
+    }
+
+    const supabase = this.supabaseService.createServiceClient();
+    const { targetIds, postIds, all, days, restore } = payload || {};
+    const undo = restore === true || restore === "true";
+
+    const window = Math.min(Math.max(Number(days) || FAILURE_WINDOW_DAYS, 1), 365);
+    const since = new Date(Date.now() - window * 86400000).toISOString();
+
+    const patch = undo
+      ? { failure_cleared_at: null, failure_cleared_by: null }
+      : { failure_cleared_at: new Date().toISOString(), failure_cleared_by: me?.id || null };
+
+    const wantTargets = Array.isArray(targetIds) ? targetIds.filter(Boolean) : [];
+    const wantPosts = Array.isArray(postIds) ? postIds.filter(Boolean) : [];
+    if (!all && !wantTargets.length && !wantPosts.length) {
+      throw new BadRequestException("Nothing selected — pass targetIds, postIds, or all: true.");
+    }
+
+    let targetCount = 0;
+    let postCount = 0;
+
+    if (all) {
+      // Scoped to the same window the feed is showing, so "clear all" can only
+      // ever affect rows the person could actually see.
+      let tq = supabase.from("post_targets").update(patch).eq("status", "failed").gte("created_at", since);
+      tq = undo ? tq.not("failure_cleared_at", "is", null) : tq.is("failure_cleared_at", null);
+      const { data: tRows, error: tErr } = await tq;
+      if (tErr) throw new InternalServerErrorException(tErr.message);
+      targetCount = (tRows || []).length;
+
+      let pq = supabase
+        .from("scheduled_posts")
+        .update(patch)
+        .eq("user_id", OWNER_ID)
+        .eq("status", "failed")
+        .gte("scheduled_for", since);
+      pq = undo ? pq.not("failure_cleared_at", "is", null) : pq.is("failure_cleared_at", null);
+      const { data: pRows, error: pErr } = await pq;
+      if (pErr) throw new InternalServerErrorException(pErr.message);
+      postCount = (pRows || []).length;
+    } else {
+      if (wantTargets.length) {
+        const { data, error } = await supabase
+          .from("post_targets")
+          .update(patch)
+          .in("id", wantTargets)
+          .eq("status", "failed");
+        if (error) throw new InternalServerErrorException(error.message);
+        targetCount = (data || []).length;
+      }
+      if (wantPosts.length) {
+        const { data, error } = await supabase
+          .from("scheduled_posts")
+          .update(patch)
+          .in("id", wantPosts)
+          .eq("user_id", OWNER_ID)
+          .eq("status", "failed");
+        if (error) throw new InternalServerErrorException(error.message);
+        postCount = (data || []).length;
+      }
+    }
+
+    const affected = targetCount + postCount;
+    await logActivity({
+      type: undo ? "post.failures_restored" : "post.failures_cleared",
+      title: undo ? `Restored ${affected} cleared failure(s)` : `Cleared ${affected} failure(s) from the error list`,
+      status: "info",
+      meta: { by: me?.id || null, all: !!all, days: window, targets: targetCount, posts: postCount },
+    });
+
+    return { ok: true, affected, targets: targetCount, posts: postCount, restored: undo };
   }
 
   // POST /api/posts/retry — re-send the FAILED targets of an existing post.

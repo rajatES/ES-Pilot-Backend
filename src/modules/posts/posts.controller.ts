@@ -39,6 +39,13 @@ export class PostsController {
     return this.posts.importCsv(body, profile);
   }
 
+  // POST /api/posts/failures/clear — hide (or with restore:true, unhide) rows
+  // in the Error tab. Hides only: nothing is deleted. Admin/Group Head.
+  @Post("failures/clear")
+  clearFailures(@Body() body: any, @CurrentProfile() profile: any) {
+    return this.posts.clearFailures(body, profile);
+  }
+
   // POST /api/posts/retry — re-send the failed pages of an existing post.
   @Post("retry")
   retry(@Body() body: any, @CurrentProfile() profile: any) {

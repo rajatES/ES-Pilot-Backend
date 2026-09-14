@@ -272,6 +272,23 @@ export class ScheduledPost {
   @Column({ name: "last_error", type: "text", nullable: true })
   last_error: string | null;
 
+  // Failure "cleared" marker for the Posts → Error feed. Clearing HIDES a
+  // failure from the default feed; it never deletes anything — the target, its
+  // last_error, the post, its analytics and its history all stay exactly as
+  // they were, and unclearing puts the row straight back.
+  //
+  // A hidden failure is a dangerous thing in this app (see the comments in
+  // FailureList.jsx: the worst sentence that view can print is "No failed
+  // deliveries" when there ARE failures), so three rules travel with it:
+  // the feed always reports how many rows are cleared, it can list them on
+  // demand, and every clear records who did it and when. Anything less would
+  // turn a tidy-up into a silent false negative.
+  @Column({ name: "failure_cleared_at", type: "timestamptz", nullable: true })
+  failure_cleared_at: Date | null;
+
+  @Column({ name: "failure_cleared_by", type: "uuid", nullable: true })
+  failure_cleared_by: string | null;
+
   @Column({ name: "sent_at", type: "timestamptz", nullable: true })
   sent_at: Date | null;
 
@@ -376,6 +393,23 @@ export class PostTarget {
 
   @Column({ name: "last_error", type: "text", nullable: true })
   last_error: string | null;
+
+  // Failure "cleared" marker for the Posts → Error feed. Clearing HIDES a
+  // failure from the default feed; it never deletes anything — the target, its
+  // last_error, the post, its analytics and its history all stay exactly as
+  // they were, and unclearing puts the row straight back.
+  //
+  // A hidden failure is a dangerous thing in this app (see the comments in
+  // FailureList.jsx: the worst sentence that view can print is "No failed
+  // deliveries" when there ARE failures), so three rules travel with it:
+  // the feed always reports how many rows are cleared, it can list them on
+  // demand, and every clear records who did it and when. Anything less would
+  // turn a tidy-up into a silent false negative.
+  @Column({ name: "failure_cleared_at", type: "timestamptz", nullable: true })
+  failure_cleared_at: Date | null;
+
+  @Column({ name: "failure_cleared_by", type: "uuid", nullable: true })
+  failure_cleared_by: string | null;
 
   @Column({ name: "sent_at", type: "timestamptz", nullable: true })
   sent_at: Date | null;
