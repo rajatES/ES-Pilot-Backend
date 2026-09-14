@@ -7,6 +7,7 @@ import {
 } from "@nestjs/common";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { QueuesService } from "../queues/queues.service";
+import { PublisherService } from "../publisher/publisher.service";
 // Ported plain-JS integrations (allowJs). Types resolve to `any`.
 import {
   publishFacebookPost,
@@ -66,6 +67,7 @@ export class PostsService {
   constructor(
     private readonly supabaseService: SupabaseService,
     private readonly queuesService: QueuesService,
+    private readonly publisher: PublisherService,
   ) {}
 
   async list() {
@@ -781,6 +783,157 @@ export class PostsService {
     }
 
     throw new BadRequestException("Unknown action.");
+  }
+
+  // POST /api/posts/retry — re-send the FAILED targets of an existing post.
+  //
+  // Retry in place rather than cloning: the post keeps its id, its approval
+  // history, its author and its analytics linkage, and the pages that already
+  // published are untouched. /api/posts/recycle is the other tool — that one
+  // deliberately makes a NEW post for ALL pages.
+  //
+  // Nothing here talks to a platform. Eligible targets are reset to
+  // "scheduled" and handed to PublisherService, the same code /api/cron/publish
+  // runs — which is why this covers Postiz-backed channels (Threads, standalone
+  // Instagram, X), Instagram, YouTube and Facebook posts/Reels/Stories without
+  // knowing anything about them.
+  //
+  // `scheduledFor` omitted = send now. Given a time, the targets go back on the
+  // queue and the normal cron run picks them up.
+  async retry(payload: any, author: any) {
+    const supabase = this.supabaseService.createServiceClient();
+    const { postId, targetIds, scheduledFor } = payload || {};
+    if (!postId) throw new BadRequestException("postId is required.");
+
+    let when: Date | null = null;
+    if (scheduledFor) {
+      when = new Date(scheduledFor);
+      if (Number.isNaN(when.getTime())) throw new BadRequestException("Invalid schedule time.");
+    }
+
+    const { data: post, error } = await supabase
+      .from("scheduled_posts")
+      .select("*, post_targets(*, social_accounts(*))")
+      .eq("id", postId)
+      .eq("user_id", OWNER_ID)
+      .maybeSingle();
+    if (error) throw new InternalServerErrorException(error.message);
+    if (!post) throw new NotFoundException("Post not found.");
+
+    // An explicit target list narrows the retry to those pages; without one,
+    // every failed page on the post is retried.
+    const wanted = Array.isArray(targetIds) && targetIds.length ? new Set(targetIds) : null;
+    const candidates = (post.post_targets || []).filter(
+      (t: any) => t.status === "failed" && (!wanted || wanted.has(t.id)),
+    );
+
+    if (!candidates.length) {
+      throw new BadRequestException(
+        wanted ? "None of the selected pages are in a failed state." : "This post has no failed pages to retry.",
+      );
+    }
+
+    const eligible: any[] = [];
+    const skipped: any[] = [];
+    const name = (t: any) => t.social_accounts?.display_name || "Unknown channel";
+
+    for (const target of candidates) {
+      const account = target.social_accounts;
+
+      // THE double-post guard. A target holding an external_post_id reached the
+      // platform and got an id back, so whatever failed afterwards (the first
+      // comment, a status write) happened AFTER the post was live. Re-sending
+      // would publish it twice, and a duplicate on a live page cannot be taken
+      // back. These need /api/posts/verify, not a retry.
+      if (target.external_post_id) {
+        skipped.push({
+          targetId: target.id,
+          channel: name(target),
+          reason: "Already reached the platform — it has a post id. Check the page and verify instead of re-sending.",
+        });
+        continue;
+      }
+
+      if (!account) {
+        skipped.push({ targetId: target.id, channel: name(target), reason: "Its channel is no longer connected." });
+        continue;
+      }
+
+      if (isLocked(account)) {
+        skipped.push({ targetId: target.id, channel: name(target), reason: "This page is locked for posting." });
+        continue;
+      }
+
+      // Same check the publisher would run, applied HERE so an unpublishable
+      // account is reported as a skip with its real reason instead of being
+      // queued and failing again a moment later with the same error.
+      try {
+        assertPublishable(account);
+      } catch (e) {
+        skipped.push({ targetId: target.id, channel: name(target), reason: e.message });
+        continue;
+      }
+
+      eligible.push(target);
+    }
+
+    if (!eligible.length) {
+      return { ok: false, retried: 0, published: 0, failed: 0, skipped, queued: false };
+    }
+
+    // Back onto the queue. last_error and sent_at are cleared so a target that
+    // fails again carries the NEW reason, not a stale one.
+    const eligibleIds = eligible.map((t: any) => t.id);
+    const { error: resetError } = await supabase
+      .from("post_targets")
+      .update({ status: "scheduled", last_error: null, sent_at: null })
+      .in("id", eligibleIds);
+    if (resetError) throw new InternalServerErrorException(resetError.message);
+
+    const sendNow = !when;
+    await supabase
+      .from("scheduled_posts")
+      .update({
+        scheduled_for: (when || new Date()).toISOString(),
+        last_error: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", post.id)
+      .eq("user_id", OWNER_ID);
+
+    // Let the shared rule decide the post's status rather than forcing
+    // "scheduled": a post can have pages still awaiting review alongside the
+    // failed ones, and hard-coding a status here would overwrite that and drop
+    // the post out of the review queue.
+    await this.publisher.refreshPostStatus(supabase, post.id);
+
+    if (!sendNow) {
+      await logActivity({
+        type: "post.retried",
+        title: `Requeued ${eligible.length} failed page(s) for ${when.toLocaleString()}`,
+        status: "info",
+        meta: { postId: post.id, targetIds: eligibleIds, by: author?.id || null },
+      });
+      return { ok: true, retried: eligible.length, published: 0, failed: 0, skipped, queued: true };
+    }
+
+    // Send now — run the queue publisher against just these targets. Scoped to
+    // this post on purpose: a retry button must not drag every other due post
+    // into the same request.
+    const fresh = eligible.map((t: any) => ({ ...t, status: "scheduled", last_error: null }));
+    const { published, failed } = await this.publisher.publishTargets(supabase, post, fresh, { context: "retry" });
+    await this.publisher.refreshPostStatus(supabase, post.id);
+
+    await logActivity({
+      type: "post.retried",
+      title: failed
+        ? `Retried ${eligible.length} failed page(s) — ${published} sent, ${failed} failed again`
+        : `Retried ${eligible.length} failed page(s) — all sent`,
+      status: failed ? (published ? "warning" : "error") : "success",
+      meta: { postId: post.id, targetIds: eligibleIds, by: author?.id || null },
+    });
+
+    return { ok: true, retried: eligible.length, published, failed, skipped, queued: false };
   }
 
   // POST /api/posts/recycle — clone a post back into the queue.

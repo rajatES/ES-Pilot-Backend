@@ -39,6 +39,12 @@ export class PostsController {
     return this.posts.importCsv(body, profile);
   }
 
+  // POST /api/posts/retry — re-send the failed pages of an existing post.
+  @Post("retry")
+  retry(@Body() body: any, @CurrentProfile() profile: any) {
+    return this.posts.retry(body, profile);
+  }
+
   // POST /api/posts/recycle — clone a post back into the queue.
   @Post("recycle")
   @HttpCode(201)

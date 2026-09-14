@@ -1,18 +1,18 @@
 import { Injectable, InternalServerErrorException, UnauthorizedException } from "@nestjs/common";
 import { createHash } from "crypto";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
-import { publishFacebookPost, publishFacebookReel, publishFacebookStory, postFacebookComment, checkFacebookPostStatus, getFacebookPostMetrics } from "../../lib/facebook";
-import { publishInstagramPost, postInstagramComment, checkInstagramPostStatus, getInstagramPostMetrics } from "../../lib/instagram";
+import { checkFacebookPostStatus, getFacebookPostMetrics } from "../../lib/facebook";
+import { checkInstagramPostStatus, getInstagramPostMetrics } from "../../lib/instagram";
 import { refreshInstagramToken } from "../../lib/instagramOAuth";
-import { publishPostizPost, reconcilePostizTarget, getPostizPostMetrics, syncPostizChannelHealth } from "../../lib/postiz";
-import { publishYouTubeVideo, checkYouTubeVideoStatus, getYouTubeVideoAnalytics } from "../../lib/youtube";
+import { reconcilePostizTarget, getPostizPostMetrics, syncPostizChannelHealth } from "../../lib/postiz";
+import { checkYouTubeVideoStatus, getYouTubeVideoAnalytics } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
-import { assertPublishable, isLocked, postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
+import { isLocked, fbFormat } from "../../lib/postContent";
 import { buildPostInsightRow } from "../../lib/postInsightRow";
-import { noteAccountPublishFailure, clearAccountPublishFailure } from "../../lib/accountHealth";
 import { ApprovalsService } from "../approvals/approvals.service";
 import { SocialSyncService } from "../insights/social-sync.service";
+import { PublisherService } from "../publisher/publisher.service";
 
 // How many due posts one publish run will work through. Raised 25 → 50 on
 // 2026-08-21 at the team's request, now that the queue-starvation fix means the
@@ -49,6 +49,7 @@ export class CronService {
     private readonly supabaseService: SupabaseService,
     private readonly approvals: ApprovalsService,
     private readonly socialSync: SocialSyncService,
+    private readonly publisher: PublisherService,
   ) {}
 
   // Auto-approve pending_review posts whose auto_approve_at has elapsed.
@@ -167,20 +168,7 @@ export class CronService {
   // question ("what is this post now?") and a second copy of this ternary would
   // be exactly the kind of drift that hides a status bug.
   private async refreshPostStatus(supabase: any, postId: string) {
-    const { data: fresh } = await supabase.from("post_targets").select("status").eq("post_id", postId);
-    const statuses = (fresh || []).map((t: any) => t.status);
-    const newStatus = statuses.includes("pending_review")
-      ? "pending_review"
-      : statuses.some((st: string) => st === "sent" || st === "scheduled")
-        ? statuses.includes("scheduled")
-          ? "scheduled"
-          : "sent"
-        : "failed";
-    await supabase
-      .from("scheduled_posts")
-      .update({ status: newStatus, sent_at: newStatus === "sent" ? new Date().toISOString() : null })
-      .eq("id", postId);
-    return newStatus;
+    return this.publisher.refreshPostStatus(supabase, postId);
   }
 
   // See the call site in publish() for why these are failed rather than retried.
@@ -329,76 +317,11 @@ export class CronService {
         .update({ status: "publishing", updated_at: new Date().toISOString() })
         .eq("id", post.id);
 
-      for (const target of queued) {
-        const account: any = target.social_accounts;
-        try {
-          assertPublishable(account);
-          // Per-platform caption override (falls back to the master body).
-          const postData = postForPlatform(post, account.platform);
-          const result =
-            // Threads / standalone Instagram / X relay through Postiz. Tested
-            // first: the account keeps its real platform value, so it would
-            // otherwise fall into a native branch. Postiz has no add-comment
-            // endpoint, so the first comment travels with the post.
-            account.publish_via === "postiz"
-              ? await publishPostizPost({
-                  account,
-                  post: postData,
-                  options: platformOptions(post, account.platform),
-                  firstComment: post.first_comment || "",
-                })
-              : account.platform === "instagram"
-                ? await publishInstagramPost({ account, post: postData })
-                : account.platform === "youtube"
-                  ? await publishYouTubeVideo({ account, post: postData, options: platformOptions(post, "youtube") } as any)
-                  : fbFormat(post) === "reel"
-                    ? await publishFacebookReel({ account, post: postData })
-                    : fbFormat(post) === "story"
-                      ? await publishFacebookStory({ account, post: postData })
-                      : await publishFacebookPost({ account, post: postData });
-
-          await supabase
-            .from("post_targets")
-            .update({
-              status: "sent",
-              external_post_id: result.externalPostId,
-              sent_at: new Date().toISOString(),
-              last_error: null,
-            })
-            .eq("id", target.id);
-          published++;
-          // A publish proves the token still works — lift any earlier flag.
-          await clearAccountPublishFailure(account);
-
-          // Stories have no comments — skip the first comment for them. Postiz
-          // already submitted it with the post, so skip those too.
-          const isStory = account.platform === "facebook" && fbFormat(post) === "story";
-          if (!isStory && !result.firstCommentIncluded && post.first_comment?.trim() && result.externalPostId) {
-            try {
-              if (account.platform === "instagram") {
-                await postInstagramComment({ account, mediaId: result.externalPostId, message: post.first_comment });
-              } else if (account.platform === "facebook") {
-                await postFacebookComment({ account, postId: result.externalPostId, message: post.first_comment });
-              }
-            } catch (e) {
-              console.warn(`[cron] first comment failed for ${account.display_name}:`, e.message);
-            }
-          }
-        } catch (err) {
-          await supabase.from("post_targets").update({ status: "failed", last_error: err.message }).eq("id", target.id);
-          failed++;
-          // Token/permission/restriction failures are about the page, not this
-          // post — mark it so the UI says "reconnect" instead of failing every
-          // future post to it with the same opaque message.
-          await noteAccountPublishFailure(account, err.message);
-          await logActivity({
-            type: "post.failed",
-            title: `Queued post failed on ${account.display_name}`,
-            status: "error",
-            meta: { postId: post.id, error: err.message },
-          });
-        }
-      }
+      // Dispatch lives in PublisherService so /api/posts/retry runs the exact
+      // same code — see the note there on why a second copy is dangerous.
+      const counts = await this.publisher.publishTargets(supabase, post, queued, { context: "cron" });
+      published += counts.published;
+      failed += counts.failed;
 
       // Keep the post in review while any page still awaits approval — only the
       // approved pages just published above; the rest stay pending.
