@@ -302,10 +302,41 @@ export class CronService {
           await supabase.from("scheduled_posts").update({ link_url: tagged }).eq("id", post.id);
         }
       }
-      const queued = (post.post_targets || []).filter(
-        (t) => t.status === "scheduled" && !t.external_post_id && t.social_accounts,
-      );
-      if (!queued.length) continue;
+      const ready = (post.post_targets || []).filter((t) => t.status === "scheduled" && !t.external_post_id);
+
+      // A ready target whose channel row is gone used to be dropped by the
+      // `t.social_accounts` filter and nothing else ever looked at it again:
+      // it stayed "scheduled" forever, never published, never failed, and never
+      // appeared in the Error tab — which reads failed targets. Eight of these
+      // were sitting in production from 2026-08-05, on a post still showing as
+      // scheduled. That is the exact silent-failure shape the Error tab exists
+      // to prevent, so they are recorded as failures now. Same wording as
+      // posts.service.retry()'s skip reason, because it is the same condition.
+      const orphaned = ready.filter((t) => !t.social_accounts);
+      if (orphaned.length) {
+        await supabase
+          .from("post_targets")
+          .update({ status: "failed", last_error: "Its channel is no longer connected." })
+          .in("id", orphaned.map((t: any) => t.id));
+        await logActivity({
+          type: "post.failed",
+          title: `${orphaned.length} queued page(s) had no channel left to publish to`,
+          status: "error",
+          meta: {
+            postId: post.id,
+            targetIds: orphaned.map((t: any) => t.id),
+            note: "The social account was deleted after the post was scheduled. Nothing was sent.",
+          },
+        });
+      }
+
+      const queued = ready.filter((t) => t.social_accounts);
+      if (!queued.length) {
+        // Still recompute: the orphans above just changed this post's outcome,
+        // and leaving it at "scheduled" would keep claiming work is pending.
+        if (orphaned.length) await this.refreshPostStatus(supabase, post.id);
+        continue;
+      }
 
       // Stamp updated_at explicitly: the pg shim issues raw UPDATEs, and
       // TypeORM's @UpdateDateColumn only fires through the repository API, so

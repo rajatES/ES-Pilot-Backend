@@ -96,6 +96,9 @@ export class PostsService {
     if (this.rejectedBackfilled) return;
     this.rejectedBackfilled = true; // set first: the update is idempotent, and a
                                     // concurrent request should not run it twice
+    // Same once-per-process maintenance slot, and it belongs here for the same
+    // reason: nothing else in the app will ever look at those rows.
+    await this.sweepOrphanedTargets(supabase);
     try {
       const { data, error } = await supabase
         .from("post_targets")
@@ -307,6 +310,62 @@ export class PostsService {
         clearedTargetError || clearedPostError ? null : (clearedTargets || 0) + (clearedPosts || 0),
       includingCleared: includeCleared,
     };
+  }
+
+  // Remove the targets belonging to posts being deleted. Best-effort by design:
+  // a post the user asked to delete should still go even if this fails, and a
+  // leftover target is recoverable (sweepOrphanedTargets below), while a post
+  // that refuses to delete is not.
+  private async deleteTargetsFor(supabase: any, postIds: string[]) {
+    if (!postIds.length) return;
+    const { error } = await supabase.from("post_targets").delete().in("post_id", postIds);
+    if (error) console.warn("[posts] could not delete targets for removed post(s):", error.message);
+  }
+
+  // Retire targets whose post no longer exists.
+  //
+  // They were created before remove()/bulk() cleaned up after themselves, and
+  // nothing else will ever touch them: a "scheduled" orphan is picked up by the
+  // publish cron's ready-target scan, contributes a post id that resolves to
+  // nothing, and is then dropped on every single run, forever.
+  //
+  // Marked failed rather than deleted. It takes them out of the publish path —
+  // the cron only ever reads "scheduled" — without destroying rows in someone's
+  // production database on our initiative. They stay inspectable; purging them
+  // is a decision for a human.
+  private async sweepOrphanedTargets(supabase: any) {
+    const { data: live, error } = await supabase
+      .from("post_targets")
+      .select("id, post_id")
+      .in("status", ["scheduled", "draft", "pending_review"]);
+    if (error || !live?.length) return;
+
+    const postIds = [...new Set(live.map((t: any) => t.post_id).filter(Boolean))];
+    if (!postIds.length) return;
+    const { data: posts, error: postError } = await supabase
+      .from("scheduled_posts")
+      .select("id")
+      .in("id", postIds);
+    // A failed lookup must NOT be read as "none of these posts exist" — that
+    // would retire every queued target in the system.
+    if (postError) return;
+
+    const alive = new Set((posts || []).map((p: any) => p.id));
+    const orphans = live.filter((t: any) => !alive.has(t.post_id)).map((t: any) => t.id);
+    if (!orphans.length) return;
+
+    const { error: updateError } = await supabase
+      .from("post_targets")
+      .update({
+        status: "failed",
+        last_error: "The post this page belonged to was deleted, so nothing was ever sent.",
+      })
+      .in("id", orphans);
+    if (updateError) {
+      console.warn("[posts] could not retire orphaned targets:", updateError.message);
+      return;
+    }
+    console.log(`[posts] retired ${orphans.length} target(s) whose post no longer exists.`);
   }
 
   // One failed target, flattened for the UI. Kept separate so the shape is
@@ -815,6 +874,14 @@ export class PostsService {
       throw new ConflictException("Cannot delete a post that is currently publishing.");
     }
 
+    // Targets first. post_targets carries NO foreign key to scheduled_posts
+    // (verified against production: zero FK constraints on the table), so a
+    // bare post delete left its targets behind — 46 such rows had accumulated,
+    // 31 of them still "scheduled". An orphan never publishes (every publish
+    // path reads the post), never fails, and cannot appear in the Error tab,
+    // which joins scheduled_posts. It just sits there.
+    await this.deleteTargetsFor(supabase, [id]);
+
     const { error: deleteError } = await supabase
       .from("scheduled_posts")
       .delete()
@@ -848,6 +915,8 @@ export class PostsService {
     if (action === "delete") {
       const eligibleIds = eligible.map((p) => p.id);
       if (eligibleIds.length) {
+        // Same reason as remove(): no FK, so the targets have to go explicitly.
+        await this.deleteTargetsFor(supabase, eligibleIds);
         const { error } = await supabase
           .from("scheduled_posts")
           .delete()
