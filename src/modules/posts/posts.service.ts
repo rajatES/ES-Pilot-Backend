@@ -20,7 +20,7 @@ import {
   publishUnpublishedFacebookPost,
 } from "../../lib/facebook";
 import { publishInstagramPost, postInstagramComment, checkInstagramPostStatus } from "../../lib/instagram";
-import { publishPostizPost, reconcilePostizTarget } from "../../lib/postiz";
+import { publishPostizPost, reconcilePostizTarget, POSTIZ_REJECTED_ERROR } from "../../lib/postiz";
 import { publishYouTubeVideo, checkYouTubeVideoStatus, updateScheduledYouTubeVideo } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
@@ -71,8 +71,64 @@ export class PostsService {
     private readonly publisher: PublisherService,
   ) {}
 
+  // Has this process already filled publish_rejected_at for the rows that
+  // predate the column? See backfillRejectedTargets().
+  private rejectedBackfilled = false;
+
+  // One-time fill of post_targets.publish_rejected_at for failures recorded
+  // before that column existed.
+  //
+  // It matters because nothing would ever fill them otherwise: the verify sweep
+  // that sets the column only looks at posts still "sent"/"publishing" within
+  // 24h, and a rejection has already moved its target to "failed". Without this
+  // every platform-rejected delivery from before today would stay permanently
+  // un-re-sendable — the exact complaint this change answers.
+  //
+  // The evidence is POSTIZ_REJECTED_ERROR compared with `=`: a constant this
+  // codebase writes, from the one path that writes it, and only when Postiz
+  // reported state ERROR. That is a different thing from reading meaning out of
+  // vendor error text, which must never decide that a re-send is safe.
+  //
+  // Lazy and once per process, the same shape as the sports/design-template
+  // seeds: after the first run nothing matches, and a failure here is logged and
+  // left for the next boot rather than breaking the page that triggered it.
+  private async backfillRejectedTargets(supabase: any) {
+    if (this.rejectedBackfilled) return;
+    this.rejectedBackfilled = true; // set first: the update is idempotent, and a
+                                    // concurrent request should not run it twice
+    try {
+      const { data, error } = await supabase
+        .from("post_targets")
+        // now(), not the original moment — we cannot know when Postiz was asked,
+        // only that it answered. The column is a marker, and nothing reads its
+        // value as a timestamp.
+        .update({ publish_rejected_at: new Date().toISOString() })
+        .eq("status", "failed")
+        .eq("last_error", POSTIZ_REJECTED_ERROR)
+        .is("publish_rejected_at", null)
+        .not("external_post_id", "is", null)
+        // A permalink means Postiz handed back the URL of a LIVE post, so
+        // whatever it flagged, the post went out. Production had 5 such rows
+        // among 29 as of 2026-09-21: re-sending one would duplicate it on a
+        // live page. Newer rows can't look like this — getPostizPostState now
+        // separates the two — but these were written before it could.
+        .is("permalink", null);
+      if (error) throw new Error(error.message);
+      if (data?.length) {
+        console.log(`[posts] marked ${data.length} pre-existing platform-rejected target(s) as re-sendable.`);
+      }
+    } catch (e: any) {
+      this.rejectedBackfilled = false;
+      console.warn("[posts] could not backfill publish_rejected_at:", e.message);
+    }
+  }
+
   async list() {
     const supabase = this.supabaseService.createServiceClient();
+    // Both this and failures() feed a Re-send button, so both need the backfill
+    // to have run — otherwise the drawer and the Error tab would disagree about
+    // whether the same failure can go out again.
+    await this.backfillRejectedTargets(supabase);
 
     const [
       { data: accounts, error: accountsError },
@@ -134,6 +190,7 @@ export class PostsService {
   // without touching this.
   async failures(query: any = {}) {
     const supabase = this.supabaseService.createServiceClient();
+    await this.backfillRejectedTargets(supabase);
 
     const days = Math.min(Math.max(Number(query?.days) || FAILURE_WINDOW_DAYS, 1), 365);
     const since = new Date(Date.now() - days * 86400000).toISOString();
@@ -217,11 +274,14 @@ export class PostsService {
         avatarUrl: null,
         publishVia: null,
         body: post.body || "",
+        linkUrl: post.link_url || null,
+        edited: false,
         createdBy: post.created_by || null,
         when: post.scheduled_for || post.created_at || null,
         error: post.last_error || "This post failed before it reached any page.",
         permalink: null,
         externalPostId: null,
+        rejectedByPlatform: false,
         source: post.source || "app",
         clearedAt: post.failure_cleared_at || null,
       });
@@ -263,7 +323,15 @@ export class PostsService {
       platform: account.platform || target.platform || null,
       avatarUrl: account.avatar_url || null,
       publishVia: account.publish_via || null,
-      body: post.body || "",
+      // The copy THIS page was sent, which is the post's unless an earlier
+      // re-send edited it for this page alone. Shown, searched and — when the
+      // row is edited again before re-sending — pre-filled from here, so the
+      // Error tab never offers back a caption that was already replaced.
+      body: target.content_override?.body ?? post.body ?? "",
+      linkUrl: (target.content_override && "linkUrl" in target.content_override
+        ? target.content_override.linkUrl
+        : post.link_url) || null,
+      edited: !!target.content_override,
       createdBy: post.created_by || null,
       when: post.scheduled_for || target.created_at || null,
       // Every failure path writes last_error. A blank one still gets a row —
@@ -272,6 +340,11 @@ export class PostsService {
       error: target.last_error || "Failed with no reason recorded.",
       permalink: target.permalink || null,
       externalPostId: target.external_post_id || null,
+      // Whether the id above is known to be dead. The UI needs this to decide
+      // whether to offer Re-send: an external_post_id normally means "live,
+      // re-sending duplicates it", but a confirmed rejection means the opposite.
+      // Mirrors the guard in retry(), which is what actually enforces it.
+      rejectedByPlatform: !!target.publish_rejected_at,
       source: post.source || "app",
       clearedAt: target.failure_cleared_at || null,
     };
@@ -943,7 +1016,7 @@ export class PostsService {
   // queue and the normal cron run picks them up.
   async retry(payload: any, author: any) {
     const supabase = this.supabaseService.createServiceClient();
-    const { postId, targetIds, scheduledFor } = payload || {};
+    const { postId, targetIds, scheduledFor, body, linkUrl } = payload || {};
     if (!postId) throw new BadRequestException("postId is required.");
 
     let when: Date | null = null;
@@ -951,6 +1024,18 @@ export class PostsService {
       when = new Date(scheduledFor);
       if (Number.isNaN(when.getTime())) throw new BadRequestException("Invalid schedule time.");
     }
+
+    // An optional edit applied to this re-send: the caption, the link, or both.
+    // Same emptiness rule as update() — a blank caption is a mistake, not an
+    // instruction — and `linkUrl: null` is an explicit "drop the link", which is
+    // why the two are tracked by presence rather than truthiness.
+    const editsBody = body !== undefined;
+    const editsLink = linkUrl !== undefined;
+    if (editsBody && (typeof body !== "string" || !body.trim())) {
+      throw new BadRequestException("Caption can't be empty.");
+    }
+    const newBody = editsBody ? body.trim() : null;
+    const newLink = editsLink ? (linkUrl || null) : null;
 
     const { data: post, error } = await supabase
       .from("scheduled_posts")
@@ -986,7 +1071,13 @@ export class PostsService {
       // comment, a status write) happened AFTER the post was live. Re-sending
       // would publish it twice, and a duplicate on a live page cannot be taken
       // back. These need /api/posts/verify, not a retry.
-      if (target.external_post_id) {
+      //
+      // The one exception is a target we have since CONFIRMED never published —
+      // Postiz reporting the post's state as ERROR, recorded as
+      // publish_rejected_at. There the id exists but nothing is live behind it,
+      // so re-sending creates no duplicate. Note this reads the recorded fact,
+      // never the error text: "rejected" in a message proves nothing.
+      if (target.external_post_id && !target.publish_rejected_at) {
         skipped.push({
           targetId: target.id,
           channel: name(target),
@@ -1025,10 +1116,67 @@ export class PostsService {
     // Back onto the queue. last_error and sent_at are cleared so a target that
     // fails again carries the NEW reason, not a stale one.
     const eligibleIds = eligible.map((t: any) => t.id);
-    const { error: resetError } = await supabase
-      .from("post_targets")
-      .update({ status: "scheduled", last_error: null, sent_at: null })
-      .in("id", eligibleIds);
+    const reset: any = { status: "scheduled", last_error: null, sent_at: null };
+
+    // Any confirmed-rejected target among these is losing its dead id here, so
+    // record it before it goes — the activity entry below is then the only
+    // place that still names it.
+    const discardedIds = eligible
+      .filter((t: any) => t.external_post_id && t.publish_rejected_at)
+      .map((t: any) => ({ targetId: t.id, externalPostId: t.external_post_id }));
+
+    // Does anything this post produced still stand? Targets being re-sent are
+    // excluded: a confirmed rejection carries an external_post_id that is
+    // precisely NOT live, and counting it here would make every rejection look
+    // like a partial success.
+    const retrying = new Set(eligibleIds);
+    const somethingLive = (post.post_targets || []).some(
+      (t: any) => !retrying.has(t.id) && (t.status === "sent" || !!t.external_post_id),
+    );
+
+    if (editsBody || editsLink) {
+      if (somethingLive) {
+        // Other pages already published this post, so its body is the record of
+        // what THEY are showing. The edit rides on the target instead — see
+        // PostTarget.content_override.
+        const override: any = {};
+        if (editsBody) override.body = newBody;
+        if (editsLink) override.linkUrl = newLink;
+        reset.content_override = override;
+      } else {
+        // Nothing published anywhere, so the post itself is the truth and can
+        // simply be edited. Any override from an earlier attempt is dropped so
+        // it cannot shadow the caption the user just wrote.
+        const postEdit: any = {};
+        if (editsBody) postEdit.body = newBody;
+        if (editsLink) postEdit.link_url = newLink;
+        const { error: editError } = await supabase
+          .from("scheduled_posts")
+          .update(postEdit)
+          .eq("id", post.id)
+          .eq("user_id", OWNER_ID);
+        if (editError) throw new InternalServerErrorException(editError.message);
+        Object.assign(post, postEdit);
+        reset.content_override = null;
+      }
+    }
+
+    if (discardedIds.length) {
+      // A rejected target keeps its (dead) external_post_id until it is
+      // actually re-sent. Clearing it here is not tidiness: the double-post
+      // guard and the cron's ready-target query both treat a present id as
+      // "already on the platform", so a scheduled re-send would never be picked
+      // up and a second Re-send would be refused. The permalink goes with it —
+      // it points at nothing. Written for every eligible row rather than just
+      // the rejected ones, which is a no-op for the rest: they only got past
+      // the guard above by having no id, and a permalink never exists without
+      // one.
+      reset.external_post_id = null;
+      reset.permalink = null;
+      reset.publish_rejected_at = null;
+    }
+
+    const { error: resetError } = await supabase.from("post_targets").update(reset).in("id", eligibleIds);
     if (resetError) throw new InternalServerErrorException(resetError.message);
 
     const sendNow = !when;
@@ -1048,20 +1196,36 @@ export class PostsService {
     // the post out of the review queue.
     await this.publisher.refreshPostStatus(supabase, post.id);
 
+    // What this retry changed, beyond the targets it touched. Both belong in
+    // the record: an edited re-send published something different from what the
+    // post said a moment ago, and a discarded id is a reference no row holds
+    // any more.
+    const retryMeta = {
+      postId: post.id,
+      targetIds: eligibleIds,
+      by: author?.id || null,
+      ...(editsBody || editsLink
+        ? { edited: { ...(editsBody ? { body: newBody } : {}), ...(editsLink ? { linkUrl: newLink } : {}) }, editScope: somethingLive ? "target" : "post" }
+        : {}),
+      ...(discardedIds.length ? { discardedRejectedIds: discardedIds } : {}),
+    };
+
     if (!sendNow) {
       await logActivity({
         type: "post.retried",
         title: `Requeued ${eligible.length} failed page(s) for ${when.toLocaleString()}`,
         status: "info",
-        meta: { postId: post.id, targetIds: eligibleIds, by: author?.id || null },
+        meta: retryMeta,
       });
       return { ok: true, retried: eligible.length, published: 0, failed: 0, skipped, queued: true };
     }
 
     // Send now — run the queue publisher against just these targets. Scoped to
     // this post on purpose: a retry button must not drag every other due post
-    // into the same request.
-    const fresh = eligible.map((t: any) => ({ ...t, status: "scheduled", last_error: null }));
+    // into the same request. The rows carry `reset`, so the publisher sees the
+    // same per-page override that was just written rather than the stale one it
+    // was read with.
+    const fresh = eligible.map((t: any) => ({ ...t, ...reset }));
     const { published, failed } = await this.publisher.publishTargets(supabase, post, fresh, { context: "retry" });
     await this.publisher.refreshPostStatus(supabase, post.id);
 
@@ -1071,7 +1235,7 @@ export class PostsService {
         ? `Retried ${eligible.length} failed page(s) — ${published} sent, ${failed} failed again`
         : `Retried ${eligible.length} failed page(s) — all sent`,
       status: failed ? (published ? "warning" : "error") : "success",
-      meta: { postId: post.id, targetIds: eligibleIds, by: author?.id || null },
+      meta: retryMeta,
     });
 
     return { ok: true, retried: eligible.length, published, failed, skipped, queued: false };

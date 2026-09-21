@@ -422,6 +422,30 @@ const COMMON_PAGE_SIZES = new Set([10, 20, 25, 50, 100, 200]);
 // "deleted on platform" would invent deletions — the same false-positive class
 // that bit auto-optimized Facebook reels. Callers use this for the permalink
 // and to notice state === "ERROR".
+// The exact text reconcilePostizTarget records when Postiz reports a post's
+// state as ERROR *and* has nothing to show for it. Exported because it is the
+// ONLY evidence that exists for rows that failed BEFORE
+// post_targets.publish_rejected_at did — posts.service backs that column fill
+// from it, once. It is matched by exact equality, as a constant we wrote
+// ourselves; nothing pattern-matches vendor error text to decide a re-send is
+// safe.
+export const POSTIZ_REJECTED_ERROR = "Postiz reported this post as failed on the platform.";
+
+// The other half of state:"ERROR" — Postiz says the post errored, yet hands
+// back the URL of the live post. Observed on production Threads channels
+// (2026-09: 5 of 29 ERROR rows carried a real threads.com permalink), most
+// likely a post-publish step such as the thread child or first comment failing
+// after the post itself went out.
+//
+// This has to read differently from the message above, because the two demand
+// opposite actions: one is safe to re-send, this one would duplicate a live
+// post. Nothing derives behaviour from the text — publish_rejected_at does that
+// — but a human reading the Error tab acts on it, and "failed" next to a
+// working link is the sentence that gets a live post published twice.
+export const POSTIZ_ERRORED_BUT_LIVE =
+  "Postiz flagged this post as errored, but the platform did publish it — open it and check before doing anything. " +
+  "Usually the post is fine and a follow-up step (the thread reply or first comment) is what failed.";
+
 export async function getPostizPostState({ externalPostId, sentAt }) {
   if (isMockMode() || String(externalPostId).includes("_mock_")) {
     return { found: true, state: "PUBLISHED", permalink: null, error: null };
@@ -461,11 +485,20 @@ export async function getPostizPostState({ externalPostId, sentAt }) {
     return { found: false, state: null, permalink: null, error: null };
   }
 
+  // `live` is the load-bearing bit, not `state`. Postiz returns state "ERROR"
+  // for two different outcomes and only the release fields tell them apart:
+  // nothing published, or published-then-something-else-broke. Treating the
+  // second as a failed publish is how a live post gets re-sent as a duplicate.
+  const errored = match.state === "ERROR";
+  const live = !!(match.releaseURL || match.releaseId);
   return {
     found: true,
     state: match.state || null,
     permalink: match.releaseURL || null,
-    error: match.state === "ERROR" ? "Postiz reported this post as failed on the platform." : null,
+    live,
+    // Only an ERROR with nothing live behind it is a rejection we can act on.
+    rejected: errored && !live,
+    error: errored ? (live ? POSTIZ_ERRORED_BUT_LIVE : POSTIZ_REJECTED_ERROR) : null,
   };
 }
 
@@ -534,6 +567,18 @@ export async function reconcilePostizTarget(target) {
     if (failed) {
       patch.status = "failed";
       patch.last_error = state.error;
+      // ONLY when Postiz gave us no release URL or id. Then the
+      // external_post_id on this row is a dead reference rather than a
+      // published post, and recording that is what makes the failure
+      // re-sendable — the retry double-post guard keys off external_post_id,
+      // and this is the only evidence that can safely override it.
+      //
+      // An ERROR that DOES carry a release is the opposite case: the post is
+      // live. It still becomes a failed target (something in the send really
+      // did break, and hiding that is how the original "failures were
+      // invisible" bug happened), but it must never become re-sendable.
+      // See PostTarget.publish_rejected_at.
+      if (state.rejected) patch.publish_rejected_at = new Date().toISOString();
     }
 
     await supabase.from("post_targets").update(patch).eq("id", target.id);
@@ -555,7 +600,10 @@ export async function reconcilePostizTarget(target) {
           externalPostId: target.external_post_id,
           error: state.error,
           wholePostFailed,
-          note: "Accepted by Postiz, then rejected by the platform — detected on verify, not at publish time.",
+          live: state.live,
+          note: state.live
+            ? "Postiz reported ERROR but the post IS live — a post-publish step failed, not the publish. NOT re-sendable."
+            : "Accepted by Postiz, then rejected by the platform — detected on verify, not at publish time.",
         },
       });
     }

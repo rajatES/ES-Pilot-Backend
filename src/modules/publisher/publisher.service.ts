@@ -45,6 +45,14 @@ export class PublisherService {
         assertPublishable(account);
         // Per-platform caption override (falls back to the master body).
         const postData = postForPlatform(post, account.platform);
+        // Then the per-TARGET override, if this page carries one — an edit made
+        // when re-sending a failed delivery. Applied last so it wins over the
+        // platform caption, which is the point: it was written for this page.
+        // linkUrl is checked by presence, not truthiness, so clearing the link
+        // in that edit actually clears it instead of falling back to the post's.
+        const override = target.content_override;
+        if (override?.body) postData.body = override.body;
+        if (override && "linkUrl" in override) postData.link_url = override.linkUrl || null;
         const result =
           // Threads / standalone Instagram / X relay through Postiz. Tested
           // first: the account keeps its real platform value, so it would
@@ -74,6 +82,10 @@ export class PublisherService {
             external_post_id: result.externalPostId,
             sent_at: new Date().toISOString(),
             last_error: null,
+            // Cleared with the error: it describes the PREVIOUS id, and leaving
+            // it behind would let a later, unrelated failure on this target look
+            // like a confirmed rejection and slip past the double-post guard.
+            publish_rejected_at: null,
           })
           .eq("id", target.id);
         published++;

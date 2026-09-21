@@ -391,6 +391,35 @@ export class PostTarget {
   @Column({ name: "external_post_id", type: "text", nullable: true })
   external_post_id: string | null;
 
+  // Set when we have POSITIVE confirmation that the post behind
+  // external_post_id never went live — today only from Postiz reporting the
+  // post's state as ERROR (lib/postiz reconcilePostizTarget).
+  //
+  // It exists to carve the one safe hole in the double-post guard. That guard
+  // refuses to re-send any target holding an external_post_id, because an id
+  // normally means the platform accepted the post and re-sending would publish
+  // a duplicate nobody can take back. A platform REJECTION is the exception:
+  // there is an id, and there is demonstrably nothing live behind it. Without
+  // this column those failures were permanently un-re-sendable.
+  //
+  // Only ever set by a check that actually asked the platform — never inferred
+  // from error text, which would hand the guard back to a regex.
+  @Column({ name: "publish_rejected_at", type: "timestamptz", nullable: true })
+  publish_rejected_at: Date | null;
+
+  // Per-page content for THIS target, overriding the post's own body/link.
+  // Shape: { body?: string, linkUrl?: string | null }.
+  //
+  // Written when someone edits a failed delivery before re-sending it (Posts →
+  // Error → "Edit & re-send"). It is per-target rather than an edit of the post
+  // because a post fans out to many pages and some of them may already have
+  // published: rewriting scheduled_posts.body would silently change the app's
+  // record of what those live pages are showing. So the edit travels with the
+  // page it was made for, and the post's own body is only touched when nothing
+  // has published anywhere (posts.service retry()).
+  @Column({ name: "content_override", type: "jsonb", nullable: true })
+  content_override: { body?: string; linkUrl?: string | null } | null;
+
   @Column({ name: "last_error", type: "text", nullable: true })
   last_error: string | null;
 
