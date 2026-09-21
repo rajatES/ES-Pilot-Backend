@@ -10,9 +10,10 @@ export class InsightsController {
     private readonly socialSync: SocialSyncService,
   ) {}
 
+  // ?days=N, or ?start=YYYY-MM-DD&end=YYYY-MM-DD for a custom range.
   @Get()
-  list(@Query("days") days?: string) {
-    return this.insights.list(days ? Number(days) : 30);
+  list(@Query() query: any) {
+    return this.insights.list(query || {});
   }
 
   // Detailed per-post×page rows for the Post Analytics table.

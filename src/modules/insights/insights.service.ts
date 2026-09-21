@@ -1,4 +1,4 @@
-import { Injectable, InternalServerErrorException } from "@nestjs/common";
+import { BadRequestException, Injectable, InternalServerErrorException } from "@nestjs/common";
 import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 // @ts-ignore - plain JS platform clients (shared with the cron insights job).
 import { getFacebookPostMetrics } from "../../lib/facebook";
@@ -11,19 +11,28 @@ import { getYouTubeVideoAnalytics } from "../../lib/youtube";
 // @ts-ignore
 import { buildPostInsightRow } from "../../lib/postInsightRow";
 
+// Row cap on the Performance rollup. Presets can't exceed it at ES's volume,
+// but a custom range can, so the response reports whether it was hit rather
+// than handing back a total that silently stopped counting.
+const LIST_LIMIT = 500;
+
 // Per-post performance, built from the same platform metric APIs the insights
 // cron already uses — fetched by external_post_id, never scraped.
 @Injectable()
 export class InsightsService {
   constructor(private readonly supabaseService: SupabaseService) {}
 
-  // GET /api/insights?days=30 — rollup of stored insights per sent post.
-  async list(days = 30) {
+  // GET /api/insights?days=30, or ?start=YYYY-MM-DD&end=YYYY-MM-DD for an
+  // explicit range — rollup of stored insights per sent post.
+  async list(query: any = {}) {
     const supabase = this.supabaseService.createServiceClient();
-    const windowDays = Math.min(Math.max(Number(days) || 30, 1), 90);
-    const since = new Date(Date.now() - windowDays * 86400000).toISOString();
 
-    const { data: posts, error } = await supabase
+    // A number is still accepted so nothing that called this with plain days
+    // has to change.
+    const q = typeof query === "object" && query !== null ? query : { days: query };
+    const { sinceIso, untilIso, windowDays, start, end } = this.resolveRange(q, 90);
+
+    let postQuery = supabase
       .from("scheduled_posts")
       .select(
         // permalink feeds the Performance list's "open the live post" link.
@@ -33,9 +42,12 @@ export class InsightsService {
       )
       .eq("user_id", OWNER_ID)
       .eq("status", "sent")
-      .gte("sent_at", since)
+      .gte("sent_at", sinceIso);
+    if (untilIso) postQuery = postQuery.lte("sent_at", untilIso);
+
+    const { data: posts, error } = await postQuery
       .order("sent_at", { ascending: false })
-      .limit(500);
+      .limit(LIST_LIMIT);
     if (error) throw new InternalServerErrorException(error.message);
 
     // Latest stored insight per target (the cron keeps exactly one row/target).
@@ -84,7 +96,12 @@ export class InsightsService {
           comments: ins?.comments ?? null,
           shares: ins?.shares ?? null,
           reach: ins?.reach ?? null,
-          impressions: ins?.impressions ?? null,
+          // "Views" is what every platform now calls this and what the rest of
+          // the app shows (Post Analytics maps the same column). The COLUMN is
+          // still `impressions` because that is what these APIs were called
+          // when it was added — Facebook's post_media_view, Instagram's views
+          // and YouTube's views all land in it.
+          views: ins?.impressions ?? null,
           hasInsights: !!ins,
         };
       });
@@ -104,7 +121,7 @@ export class InsightsService {
         comments,
         shares,
         reach,
-        impressions,
+        views: impressions,
         engagement: likes + comments + shares,
         hasInsights: withInsights > 0,
         fetchedAt,
@@ -112,7 +129,63 @@ export class InsightsService {
       };
     });
 
-    return { posts: results, windowDays };
+    return {
+      posts: results,
+      windowDays,
+      // Echoed back so the header can name the actual range rather than
+      // "last N days", which is a lie for a custom one.
+      start: start || null,
+      end: end || null,
+      custom: !!(start && end),
+      // A custom range can ask for far more than the row cap, and a total that
+      // quietly stopped at 500 posts would be read as the real number. Say so
+      // instead.
+      truncated: (posts || []).length >= LIST_LIMIT,
+      limit: LIST_LIMIT,
+    };
+  }
+
+  // Turn { days } or { start, end } into an ISO window. Shared by all three
+  // entry points — the Performance rollup, the Post Analytics table and the
+  // refresh job — so a range means the same thing in every one of them. That
+  // matters most for refresh(): it re-pulls metrics for the window the caller
+  // is LOOKING at, so a range it read differently would leave exactly the posts
+  // on screen un-refreshed.
+  //
+  // Dates are read as UTC day boundaries, matching how postsDetailed has always
+  // done it. `end` is inclusive — someone picking the same day twice means that
+  // day, not an empty window.
+  private resolveRange(query: any, maxDays: number) {
+    const start = typeof query?.start === "string" ? query.start.trim() : "";
+    const end = typeof query?.end === "string" ? query.end.trim() : "";
+
+    if (start || end) {
+      if (!start || !end) throw new BadRequestException("A custom range needs both a start and an end date.");
+      const from = new Date(`${start}T00:00:00.000Z`);
+      const to = new Date(`${end}T23:59:59.999Z`);
+      if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) {
+        throw new BadRequestException("Invalid date in the custom range.");
+      }
+      if (to.getTime() < from.getTime()) {
+        throw new BadRequestException("The custom range ends before it starts.");
+      }
+      return {
+        sinceIso: from.toISOString(),
+        untilIso: to.toISOString(),
+        windowDays: Math.max(1, Math.round((to.getTime() - from.getTime()) / 86400000)),
+        start,
+        end,
+      };
+    }
+
+    const windowDays = Math.min(Math.max(Number(query?.days) || 30, 1), maxDays);
+    return {
+      sinceIso: new Date(Date.now() - windowDays * 86400000).toISOString(),
+      untilIso: null as string | null,
+      windowDays,
+      start: "",
+      end: "",
+    };
   }
 
   // GET /api/insights/posts?days=30 (or ?start=YYYY-MM-DD&end=YYYY-MM-DD) —
@@ -120,15 +193,10 @@ export class InsightsService {
   // detailed Post Analytics table. Only published targets (external_post_id set).
   async postsDetailed(query: any) {
     const supabase = this.supabaseService.createServiceClient();
-    const days = Math.min(Math.max(Number(query?.days) || 30, 1), 365);
-    let sinceIso: string;
-    let untilIso: string | null = null;
-    if (query?.start && query?.end) {
-      sinceIso = new Date(`${query.start}T00:00:00.000Z`).toISOString();
-      untilIso = new Date(`${query.end}T23:59:59.999Z`).toISOString();
-    } else {
-      sinceIso = new Date(Date.now() - days * 86400000).toISOString();
-    }
+    // Same range rules as list(), including rejecting a half-given or invalid
+    // custom range. This used to fall back to "last 30 days" on a bad date,
+    // which answered a question nobody asked and looked like a real result.
+    const { sinceIso, untilIso } = this.resolveRange(query, 365);
 
     let q = supabase
       .from("scheduled_posts")
@@ -331,15 +399,7 @@ export class InsightsService {
   async refresh(body: any) {
     const supabase = this.supabaseService.createServiceClient();
     const postId = body?.postId || null;
-    const days = Math.min(Math.max(Number(body?.days) || 30, 1), 365);
-    let sinceIso: string;
-    let untilIso: string | null = null;
-    if (body?.start && body?.end) {
-      sinceIso = new Date(`${body.start}T00:00:00.000Z`).toISOString();
-      untilIso = new Date(`${body.end}T23:59:59.999Z`).toISOString();
-    } else {
-      sinceIso = new Date(Date.now() - days * 86400000).toISOString();
-    }
+    const { sinceIso, untilIso } = this.resolveRange(body, 365);
 
     let q = supabase
       .from("post_targets")
