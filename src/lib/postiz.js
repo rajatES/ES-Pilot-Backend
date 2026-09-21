@@ -155,10 +155,30 @@ export async function listPostizIntegrations() {
 
 // ── Media ────────────────────────────────────────────────────────────────
 
+// The only file extensions Postiz's upload-from-url will take. Quoted from its
+// own 400: "File must have a valid extension: .png, .jpg, .jpeg, .gif, .webp,
+// or .mp4". It reads the extension off the URL, so what matters is how the S3
+// key is NAMED, not what the bytes are or what Content-Type S3 serves.
+const POSTIZ_MEDIA_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "mp4"];
+
 // Our media already sits on a public S3 URL, which is exactly what Postiz's
 // upload-from-url wants — so nothing is re-uploaded through this backend.
 // Returns { id, path } for the create-post `image` array.
 async function ingestMedia(url) {
+  // Checked here rather than left to Postiz, because its 400 names neither the
+  // file nor the post — it arrives as "Postiz request failed (400) on POST
+  // /upload-from-url" against a channel, and the person reading it has no way
+  // to know WHICH image is wrong. Uploads are normalised now (see
+  // upload.service), so this only fires for media stored before that, but those
+  // files are still in S3 and still re-sendable.
+  const ext = (String(url).split("?")[0].match(/\.([a-zA-Z0-9]+)$/) || [])[1];
+  if (!ext || !POSTIZ_MEDIA_EXTENSIONS.includes(ext.toLowerCase())) {
+    const name = String(url).split("/").pop().split("?")[0];
+    throw new Error(
+      `Threads/Instagram can't accept "${name}"${ext ? ` — .${ext.toLowerCase()} isn't a supported image type` : " — it has no file extension"}. ` +
+        `Re-upload it as ${POSTIZ_MEDIA_EXTENSIONS.join(", ")} and re-send.`,
+    );
+  }
   const data = await postizFetch("/upload-from-url", { method: "POST", body: { url } });
   if (!data?.id) throw new Error("Postiz accepted the media URL but returned no file id.");
   return { id: data.id, path: data.path || url };
@@ -195,8 +215,20 @@ export const X_REPLY_AUDIENCES = ["everyone", "following", "mentionedUsers", "su
 function buildSettings({ provider, platform, igFormat, options = {} }) {
   const settings = { __type: provider };
   if (platform === "instagram") {
-    // Our composer offers Feed | Reel; Postiz calls those "post" and "reel".
-    settings.post_type = igFormat === "reel" ? "reel" : "post";
+    // Our composer offers Feed | Reel; Postiz calls those "post" and "reel" —
+    // EXCEPT on instagram-standalone, which accepts only post|story and 400s on
+    // "reel" ("posts.0.settings.post_type must be one of the following values:
+    // post, story"). That is every Reel to all 46 standalone IG channels; it
+    // failed silently as a publish error for a month (3 recorded, 2026-08-28 to
+    // 08-31, and nobody could pick Reel again after that).
+    //
+    // Sending "post" instead is not a downgrade: Instagram files an
+    // API-published video under Reels itself, so the post still lands as a Reel.
+    // Kept as a branch rather than hardcoded, because the business-linked
+    // `instagram` provider does take "reel" and we would otherwise silently
+    // stop using it the day a channel is connected that way.
+    const standalone = provider === "instagram-standalone";
+    settings.post_type = igFormat === "reel" && !standalone ? "reel" : "post";
     settings.collaborators = [];
   }
   if (platform === "twitter") {
