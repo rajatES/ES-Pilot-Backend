@@ -233,6 +233,37 @@ export async function updateScheduledFacebookPost({ account, externalPostId, mes
   return { ok: true };
 }
 
+// Delete a published Facebook post from the Page.
+//
+// One of only TWO platforms where this is possible at all: Instagram's Graph
+// API has no delete for published media, and the Postiz-relayed channels
+// (Threads, standalone Instagram, X) expose no delete we can reach. So the
+// app's delete-from-platform feature covers Facebook and YouTube and refuses
+// everywhere else, by name, rather than pretending to a coverage it lacks.
+//
+// Works for feed posts ({pageId}_{postId}), Reels and videos alike — Graph
+// takes DELETE on the object id. Stories are not worth deleting: they expire on
+// their own within 24h.
+//
+// Deliberately does NOT swallow a 404-shaped failure into success: "already
+// gone" and "we could not reach Facebook" must not look the same to the caller,
+// because one means the post is down and the other means nobody knows.
+export async function deleteFacebookPost({ account, externalPostId }) {
+  if (!externalPostId) throw new Error("No post id recorded, so there is nothing to delete.");
+  if (String(externalPostId).includes("_mock_")) return { ok: true, mocked: true };
+  if (isMockMode()) return { ok: true, mocked: true };
+  if (!account?.access_token) throw new Error("Facebook Page access token is missing.");
+
+  const res = await fetch(`${GRAPH}/${externalPostId}`, {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ access_token: account.access_token }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(fbErrorMessage(data, "Failed to delete the Facebook post."));
+  return { ok: true };
+}
+
 // Post a first comment on an already-published Facebook post.
 // Best-effort helper — callers should treat failures as non-fatal.
 export async function postFacebookComment({ account, postId, message }) {

@@ -209,6 +209,26 @@ export async function updateScheduledYouTubeVideo({ account, videoId, scheduledF
   return { ok: true };
 }
 
+// Delete a published YouTube video.
+//
+// The second (and last) platform where the app can take a live post down — see
+// the note on deleteFacebookPost. videos.delete returns 204 with no body on
+// success, so an empty response here is the success case, not a parse failure.
+export async function deleteYouTubeVideo({ account, videoId }) {
+  if (!videoId) throw new Error("No video id recorded, so there is nothing to delete.");
+  if (String(videoId).includes("_mock_")) return { ok: true, mocked: true };
+  if (isMockMode()) return { ok: true, mocked: true };
+
+  const accessToken = await getYouTubeAccessToken(account?.refresh_token);
+  const res = await fetch(`${YOUTUBE_API}/videos?id=${encodeURIComponent(videoId)}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (res.status === 204 || res.ok) return { ok: true };
+  const data = await res.json().catch(() => ({}));
+  throw new Error(data?.error?.message || "Failed to delete the YouTube video.");
+}
+
 // Check if video still exists (for deletion detection)
 export async function checkYouTubeVideoStatus({ account, videoId }) {
   if (videoId.includes("_mock_")) {

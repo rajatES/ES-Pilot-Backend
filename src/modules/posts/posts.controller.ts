@@ -52,6 +52,14 @@ export class PostsController {
     return this.posts.retry(body, profile);
   }
 
+  // POST /api/posts/unpublish — delete the LIVE post from its platform.
+  // Facebook + YouTube only; every other channel comes back as a named skip.
+  // Admin/Group Head (enforced in the service).
+  @Post("unpublish")
+  unpublish(@Body() body: any, @CurrentProfile() profile: any) {
+    return this.posts.unpublish(body, profile);
+  }
+
   // POST /api/posts/recycle — clone a post back into the queue.
   @Post("recycle")
   @HttpCode(201)

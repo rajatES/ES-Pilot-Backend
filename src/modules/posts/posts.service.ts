@@ -18,10 +18,16 @@ import {
   updateScheduledFacebookPost,
   checkFacebookPostStatus,
   publishUnpublishedFacebookPost,
+  deleteFacebookPost,
 } from "../../lib/facebook";
 import { publishInstagramPost, postInstagramComment, checkInstagramPostStatus } from "../../lib/instagram";
 import { publishPostizPost, reconcilePostizTarget, POSTIZ_REJECTED_ERROR } from "../../lib/postiz";
-import { publishYouTubeVideo, checkYouTubeVideoStatus, updateScheduledYouTubeVideo } from "../../lib/youtube";
+import {
+  publishYouTubeVideo,
+  checkYouTubeVideoStatus,
+  updateScheduledYouTubeVideo,
+  deleteYouTubeVideo,
+} from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
 import { runCompliance } from "../../lib/compliance";
@@ -1308,6 +1314,137 @@ export class PostsService {
     });
 
     return { ok: true, retried: eligible.length, published, failed, skipped, queued: false };
+  }
+
+  // POST /api/posts/unpublish — take a LIVE post down from its platform.
+  //
+  // Facebook and YouTube only, and that is not a phase-one limit — it is the
+  // whole of what is possible. Instagram's Graph API exposes no delete for
+  // published media, and the Postiz-relayed channels (Threads, standalone
+  // Instagram, X) expose none we can reach; even if Postiz let us delete its
+  // own record, that record is a scheduling row, not the published post. So
+  // 95 of the 211 connected channels can do this and 116 cannot.
+  //
+  // A delete button that silently covers half the fan-out is worse than no
+  // button: someone takes a sensitive post down from Facebook, watches it
+  // disappear, and never learns it is still live on 56 Threads channels. Every
+  // page that cannot be deleted is therefore reported BY NAME as a skip, with
+  // its live URL where we have one, so "you must do these by hand" is the
+  // answer the caller gets rather than a silent partial success.
+  //
+  // This is the only irreversible action in the app. Everything else defers:
+  // clearing a failure hides it, a retry is guarded against duplicates, an
+  // orphaned target is marked rather than destroyed. This destroys public
+  // content and its engagement history, so it is admin/Group Head only — the
+  // same gate as clearing the error list, for a much larger consequence.
+  async unpublish(payload: any, me: any) {
+    if (!me || (me.role !== "admin" && !me.is_group_head)) {
+      throw new ForbiddenException("Only an admin or Group Head can delete a live post.");
+    }
+
+    const supabase = this.supabaseService.createServiceClient();
+    const { postId, targetIds } = payload || {};
+    if (!postId) throw new BadRequestException("postId is required.");
+
+    const { data: post, error } = await supabase
+      .from("scheduled_posts")
+      .select("*, post_targets(*, social_accounts(*))")
+      .eq("id", postId)
+      .eq("user_id", OWNER_ID)
+      .maybeSingle();
+    if (error) throw new InternalServerErrorException(error.message);
+    if (!post) throw new NotFoundException("Post not found.");
+
+    const wanted = Array.isArray(targetIds) && targetIds.length ? new Set(targetIds) : null;
+    // Only pages that actually carry a live post. A failed or queued target has
+    // nothing on the platform to remove.
+    const candidates = (post.post_targets || []).filter(
+      (t: any) => t.status === "sent" && t.external_post_id && (!wanted || wanted.has(t.id)),
+    );
+    if (!candidates.length) {
+      throw new BadRequestException(
+        wanted ? "None of the selected pages have a live post to delete." : "This post has nothing live to delete.",
+      );
+    }
+
+    const deleted: any[] = [];
+    const skipped: any[] = [];
+    const failedRows: any[] = [];
+
+    for (const target of candidates) {
+      const account = target.social_accounts;
+      const channel = account?.display_name || "Unknown channel";
+      const platform = account?.platform || target.platform;
+
+      if (!account) {
+        skipped.push({ targetId: target.id, channel, reason: "Its channel is no longer connected." });
+        continue;
+      }
+
+      // The capability test is the PLATFORM plus how we publish to it, not the
+      // platform alone: a Postiz-relayed Instagram row and a native one both
+      // say "instagram" and only one of them is even theoretically deletable
+      // (neither is, today — but the shape of the check is what keeps that
+      // honest when it changes).
+      const native = account.publish_via !== "postiz";
+      const canDelete = native && (platform === "facebook" || platform === "youtube");
+      if (!canDelete) {
+        skipped.push({
+          targetId: target.id,
+          channel,
+          platform,
+          permalink: target.permalink || null,
+          externalPostId: target.external_post_id,
+          reason:
+            account.publish_via === "postiz"
+              ? `${channel} publishes through Postiz, which gives us no way to delete a live post. Open it and delete it there.`
+              : `${platform === "instagram" ? "Instagram" : platform} has no delete in its API. Open the post and delete it by hand.`,
+        });
+        continue;
+      }
+
+      try {
+        if (platform === "facebook") {
+          await deleteFacebookPost({ account, externalPostId: target.external_post_id });
+        } else {
+          await deleteYouTubeVideo({ account, videoId: target.external_post_id });
+        }
+        // external_post_id and permalink are KEPT. The post is gone from the
+        // platform, but its id is what post_insights rows are keyed to, and
+        // throwing it away would strand every metric this post ever earned.
+        // `deleted_at` plus the status is the record that it was taken down.
+        await supabase
+          .from("post_targets")
+          .update({ status: "deleted", deleted_at: new Date().toISOString() })
+          .eq("id", target.id);
+        deleted.push({ targetId: target.id, channel, platform });
+      } catch (e: any) {
+        // Left exactly as it was. A delete that failed must not look like one
+        // that succeeded, because the difference is whether something sensitive
+        // is still public.
+        failedRows.push({ targetId: target.id, channel, platform, error: e.message });
+      }
+    }
+
+    if (deleted.length) await this.publisher.refreshPostStatus(supabase, post.id);
+
+    await logActivity({
+      type: "post.deleted",
+      title: failedRows.length
+        ? `Deleted ${deleted.length} live post(s) — ${failedRows.length} could not be removed`
+        : `Deleted ${deleted.length} live post(s)`,
+      status: failedRows.length ? "error" : skipped.length ? "warning" : "info",
+      meta: {
+        postId: post.id,
+        by: me?.id || null,
+        deleted,
+        skipped,
+        failed: failedRows,
+        note: "Removed from the platform, not just from this app. Kept the post id so analytics survive.",
+      },
+    });
+
+    return { ok: true, deleted, skipped, failed: failedRows };
   }
 
   // POST /api/posts/recycle — clone a post back into the queue.
