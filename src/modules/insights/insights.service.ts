@@ -201,7 +201,11 @@ export class InsightsService {
     let q = supabase
       .from("scheduled_posts")
       .select(
-        "id, body, image_url, media, link_url, content_type, platform_options, sent_at, scheduled_for, status, source, created_by, post_targets(id, platform, status, external_post_id, permalink, sent_at, social_accounts(id, display_name, platform, category, avatar_url))",
+        // publish_via is needed to know whether a row's live post can be
+        // deleted from the app at all — a Postiz-relayed Instagram row and a
+        // native one both say platform "instagram", and only one of them is
+        // even theoretically deletable.
+        "id, body, image_url, media, link_url, content_type, platform_options, sent_at, scheduled_for, status, source, created_by, post_targets(id, platform, status, external_post_id, permalink, sent_at, social_accounts(id, display_name, platform, category, avatar_url, publish_via))",
       )
       .eq("user_id", OWNER_ID)
       .in("status", ["sent", "deleted"])
@@ -250,6 +254,7 @@ export class InsightsService {
           platform: t.platform,
           page: acct.display_name || "Unknown",
           accountId: acct.id || null,
+          publishVia: acct.publish_via || "native",
           category: acct.category || "Other",
           avatarUrl: acct.avatar_url || null,
           title: p.body || "",
