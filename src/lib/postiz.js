@@ -126,6 +126,80 @@ function postizErrorMessage(status, data, context) {
   return `Postiz request failed (${status}) on ${context}${suffix}`;
 }
 
+// Did this failure come from Postiz's own hosting rather than from the post?
+//
+// Matched against the messages postizErrorMessage() builds, which is why it
+// lives beside it: a 5xx, a connection that never opened, or a request that
+// timed out. In all three Postiz did not answer, so nothing about the POST was
+// judged — which is what makes an automatic retry reasonable here and nowhere
+// else. Production saw 14 of these in 30 days, every one "502 — Application
+// failed to respond" (that string is Postiz's Railway edge proxy).
+//
+// NOT sufficient on its own to re-send. "Did not respond" is not "did not
+// receive": the create may have reached Postiz and published before the proxy
+// gave up. findPostizPostByContent() below is what settles that, and the
+// auto-retry sweep must ask it first.
+export function isPostizOutageError(message) {
+  return /^Postiz server error \(5\d\d\)|^Couldn't reach Postiz|^Postiz request timed out/.test(
+    String(message || ""),
+  );
+}
+
+// Look for a post we may have published without hearing back — the 502 case.
+//
+// We have no id to look up (that is exactly what the failed call would have
+// returned), so this asks the same date-windowed listing getPostizPostState
+// uses and matches on integration + content. Returns { found, id, permalink },
+// with `found: null` for INCONCLUSIVE, and the caller must treat that as
+// "don't know", never as "not published" — reading an unreachable Postiz as
+// proof of absence is precisely how a retry would double-post.
+//
+// Matching on content rather than anything stronger is a deliberate trade: the
+// only false positive is an identical caption to the same channel inside the
+// window, and that errs toward NOT re-sending, which is the safe direction.
+export async function findPostizPostByContent({ integrationId, content, around }) {
+  if (isMockMode()) return { found: false, id: null, permalink: null, error: null };
+  if (!integrationId || !content?.trim()) {
+    return { found: null, id: null, permalink: null, error: "Nothing to match on." };
+  }
+
+  const anchor = around ? new Date(around).getTime() : Date.now();
+  const pad = 6 * 3600000; // wider than the ±12h state check needs to be: this
+                           // runs ~20 minutes after the attempt, not hours later
+  const params = new URLSearchParams({
+    startDate: new Date(anchor - pad).toISOString(),
+    endDate: new Date(anchor + pad).toISOString(),
+  });
+
+  let data;
+  try {
+    data = await postizFetch(`/posts?${params}`);
+  } catch (e) {
+    return { found: null, id: null, permalink: null, error: e.message };
+  }
+
+  const posts = Array.isArray(data) ? data : data?.posts || [];
+  // Same truncation guard as getPostizPostState — a listing that stopped at a
+  // page boundary proves nothing about what is missing from it.
+  if (COMMON_PAGE_SIZES.has(posts.length)) {
+    return {
+      found: null,
+      id: null,
+      permalink: null,
+      error: `Postiz returned exactly ${posts.length} posts — the listing is probably truncated.`,
+    };
+  }
+
+  const want = content.trim().replace(/\s+/g, " ");
+  const match = posts.find(
+    (p) =>
+      String(p?.integration?.id || "") === String(integrationId) &&
+      String(p?.content || "").trim().replace(/\s+/g, " ") === want,
+  );
+  if (!match) return { found: false, id: null, permalink: null, error: null };
+  return { found: true, id: match.id || null, permalink: match.releaseURL || null, error: null };
+}
+
 // ── Workspace / channel discovery ────────────────────────────────────────
 
 // Is the configured key live? Used by the Accounts UI to explain an empty list.

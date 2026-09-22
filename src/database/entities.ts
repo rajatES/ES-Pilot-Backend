@@ -272,6 +272,25 @@ export class ScheduledPost {
   @Column({ name: "last_error", type: "text", nullable: true })
   last_error: string | null;
 
+  // When this target becomes eligible for an AUTOMATIC re-send, and how many
+  // automatic attempts it has already had.
+  //
+  // Set at failure time, by the publisher, and only for the one failure class
+  // where an automatic retry is justified: Postiz's own hosting not answering
+  // (5xx / unreachable / timeout). Deciding it there rather than in the sweep
+  // matters — the error is in hand at that moment, and a sweep that re-derived
+  // "was this an outage?" from stored text would be a second, drifting copy of
+  // that judgement.
+  //
+  // Everything else stays manual on purpose. A rejected post, a locked page, a
+  // caption the platform refused: re-sending those unchanged just fails again,
+  // and doing it on a timer turns one failure into a pattern of them.
+  @Column({ name: "auto_retry_at", type: "timestamptz", nullable: true })
+  auto_retry_at: Date | null;
+
+  @Column({ name: "auto_retry_count", type: "int", default: 0 })
+  auto_retry_count: number;
+
   // Failure "cleared" marker for the Posts → Error feed. Clearing HIDES a
   // failure from the default feed; it never deletes anything — the target, its
   // last_error, the post, its analytics and its history all stay exactly as
@@ -422,6 +441,25 @@ export class PostTarget {
 
   @Column({ name: "last_error", type: "text", nullable: true })
   last_error: string | null;
+
+  // When this target becomes eligible for an AUTOMATIC re-send, and how many
+  // automatic attempts it has already had.
+  //
+  // Set at failure time, by the publisher, and only for the one failure class
+  // where an automatic retry is justified: Postiz's own hosting not answering
+  // (5xx / unreachable / timeout). Deciding it there rather than in the sweep
+  // matters — the error is in hand at that moment, and a sweep that re-derived
+  // "was this an outage?" from stored text would be a second, drifting copy of
+  // that judgement.
+  //
+  // Everything else stays manual on purpose. A rejected post, a locked page, a
+  // caption the platform refused: re-sending those unchanged just fails again,
+  // and doing it on a timer turns one failure into a pattern of them.
+  @Column({ name: "auto_retry_at", type: "timestamptz", nullable: true })
+  auto_retry_at: Date | null;
+
+  @Column({ name: "auto_retry_count", type: "int", default: 0 })
+  auto_retry_count: number;
 
   // Failure "cleared" marker for the Posts → Error feed. Clearing HIDES a
   // failure from the default feed; it never deletes anything — the target, its

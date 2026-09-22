@@ -1,7 +1,7 @@
 import { Injectable } from "@nestjs/common";
 import { publishFacebookPost, publishFacebookReel, publishFacebookStory, postFacebookComment } from "../../lib/facebook";
 import { publishInstagramPost, postInstagramComment } from "../../lib/instagram";
-import { publishPostizPost } from "../../lib/postiz";
+import { publishPostizPost, isPostizOutageError } from "../../lib/postiz";
 import { publishYouTubeVideo } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
 import { assertPublishable, postForPlatform, platformOptions, fbFormat } from "../../lib/postContent";
@@ -22,6 +22,18 @@ import { noteAccountPublishFailure, clearAccountPublishFailure } from "../../lib
 // approvals, publish-now) keep their own inline dispatch because they also
 // decide scheduling semantics — YouTube's native publishAt, per-target review
 // stamps — that don't apply once a target is queued.
+
+// How long after a Postiz outage failure the automatic re-send becomes due, and
+// how many automatic attempts a target gets. Twenty minutes is long enough for
+// a Railway restart to finish and short enough that the post is still timely.
+//
+// One attempt, deliberately. An outage that outlasts it leaves the failure in
+// the Error tab where a human decides — which is the right place for "Postiz
+// has been down for an hour, do we still want this posted?". Raising this is a
+// one-line change if the outages turn out to be longer than the data suggests.
+export const AUTO_RETRY_DELAY_MS = 20 * 60 * 1000;
+export const AUTO_RETRY_MAX_ATTEMPTS = 1;
+
 @Injectable()
 export class PublisherService {
   // Publish a set of queued targets belonging to ONE post. Each target is
@@ -86,6 +98,8 @@ export class PublisherService {
             // it behind would let a later, unrelated failure on this target look
             // like a confirmed rejection and slip past the double-post guard.
             publish_rejected_at: null,
+            // Nothing left to retry.
+            auto_retry_at: null,
           })
           .eq("id", target.id);
         published++;
@@ -107,7 +121,22 @@ export class PublisherService {
           }
         }
       } catch (err) {
-        await supabase.from("post_targets").update({ status: "failed", last_error: err.message }).eq("id", target.id);
+        // Postiz's hosting not answering is the one failure worth retrying on a
+        // timer: nothing about the post was judged, so the same post sent again
+        // in 20 minutes is a different roll of the dice rather than a repeat of
+        // a verdict. Stamped here, where the error is in hand — see
+        // PostTarget.auto_retry_at. The sweep that acts on it still has to
+        // check Postiz did not quietly publish this before giving up.
+        const retryable =
+          isPostizOutageError(err.message) && (target.auto_retry_count || 0) < AUTO_RETRY_MAX_ATTEMPTS;
+        await supabase
+          .from("post_targets")
+          .update({
+            status: "failed",
+            last_error: err.message,
+            auto_retry_at: retryable ? new Date(Date.now() + AUTO_RETRY_DELAY_MS).toISOString() : null,
+          })
+          .eq("id", target.id);
         failed++;
         // Token/permission/restriction failures are about the page, not this
         // post — mark it so the UI says "reconnect" instead of failing every
@@ -141,7 +170,13 @@ export class PublisherService {
         ? statuses.includes("scheduled")
           ? "scheduled"
           : "sent"
-        : "failed";
+        : // Every page taken down from its platform. Without this branch the
+          // post rolled up to "failed", which reads as "this never went out"
+          // about a post that went out and was then deliberately removed —
+          // two opposite histories under one word.
+          statuses.length && statuses.every((st: string) => st === "deleted")
+          ? "deleted"
+          : "failed";
     await supabase
       .from("scheduled_posts")
       .update({ status: newStatus, sent_at: newStatus === "sent" ? new Date().toISOString() : null })

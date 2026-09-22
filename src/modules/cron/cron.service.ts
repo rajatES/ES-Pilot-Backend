@@ -4,15 +4,20 @@ import { SupabaseService, OWNER_ID } from "../../supabase/supabase.service";
 import { checkFacebookPostStatus, getFacebookPostMetrics } from "../../lib/facebook";
 import { checkInstagramPostStatus, getInstagramPostMetrics } from "../../lib/instagram";
 import { refreshInstagramToken } from "../../lib/instagramOAuth";
-import { reconcilePostizTarget, getPostizPostMetrics, syncPostizChannelHealth } from "../../lib/postiz";
+import {
+  reconcilePostizTarget,
+  getPostizPostMetrics,
+  syncPostizChannelHealth,
+  findPostizPostByContent,
+} from "../../lib/postiz";
 import { checkYouTubeVideoStatus, getYouTubeVideoAnalytics } from "../../lib/youtube";
 import { logActivity } from "../../lib/activity";
 import { appendUtm, utmTrackingEnabled } from "../../lib/utm";
-import { isLocked, fbFormat } from "../../lib/postContent";
+import { isLocked, fbFormat, assertPublishable } from "../../lib/postContent";
 import { buildPostInsightRow } from "../../lib/postInsightRow";
 import { ApprovalsService } from "../approvals/approvals.service";
 import { SocialSyncService } from "../insights/social-sync.service";
-import { PublisherService } from "../publisher/publisher.service";
+import { PublisherService, AUTO_RETRY_DELAY_MS } from "../publisher/publisher.service";
 
 // How many due posts one publish run will work through. Raised 25 → 50 on
 // 2026-08-21 at the team's request, now that the queue-starvation fix means the
@@ -30,6 +35,11 @@ const PUBLISH_BATCH_SIZE = 50;
 // attempt (every platform call has its own timeout in the low minutes), so it
 // can never race a publish that is still in flight.
 const STRANDED_TARGET_MS = 2 * 60 * 60 * 1000;
+
+// How long after the original failure an automatic retry stops being worth
+// attempting. Past this the post is stale enough that re-publishing it without
+// anyone looking is its own mistake, so it stays failed and visible instead.
+const AUTO_RETRY_GIVE_UP_MS = 6 * 60 * 60 * 1000;
 
 // Cap on the target lookup that decides WHICH posts have publishable work.
 // Purely a runaway guard — a queue of this many unpublished targets is its own
@@ -205,6 +215,171 @@ export class CronService {
     return stranded.length;
   }
 
+  // Automatic re-send of deliveries lost to a Postiz outage.
+  //
+  // Scope is deliberately tiny: ONE failure class (Postiz's hosting not
+  // answering — 5xx, unreachable, timeout), ONE target at a time, and only the
+  // pages that actually failed. A post that fanned out to X, Instagram and
+  // Threads and died only on Threads gets Threads retried and nothing else, so
+  // the two channels that already published are never touched. The publisher
+  // works per-target anyway; what is new is that nobody has to press the button.
+  //
+  // Eligibility is NOT re-derived from the error text here. The publisher
+  // stamps auto_retry_at at failure time, where the error is in hand, and this
+  // reads that stamp — one judgement, made once. See PostTarget.auto_retry_at.
+  //
+  // THE SAFETY PROBLEM, and why this is more than "call retry again":
+  // a 502 from an edge proxy means Postiz did not RESPOND. It does not mean
+  // Postiz did not RECEIVE. The create may have gone through and published
+  // seconds after the proxy gave up, and a blind retry would put the same post
+  // out twice on a live channel — across 56 Threads channels during an outage,
+  // that is the worst thing this app could do unattended. So every retry asks
+  // Postiz first whether the post is already there, and:
+  //
+  //   found     -> adopt the id, mark it sent. It published; we just never heard.
+  //   not found -> safe to re-send.
+  //   unknown   -> do NOTHING and try again next run. An unreachable Postiz is
+  //                not evidence of absence, and treating it as such is exactly
+  //                the reasoning that would double-post.
+  private async retryPostizOutages(supabase: any) {
+    const nowIso = new Date().toISOString();
+    const { data: due, error } = await supabase
+      .from("post_targets")
+      .select("*, scheduled_posts(*), social_accounts(*)")
+      .eq("status", "failed")
+      .not("auto_retry_at", "is", null)
+      .lte("auto_retry_at", nowIso)
+      .limit(100);
+    if (error || !due?.length) return { attempted: 0, published: 0, adopted: 0, deferred: 0 };
+
+    let attempted = 0,
+      published = 0,
+      adopted = 0,
+      deferred = 0;
+
+    for (const target of due) {
+      const post = target.scheduled_posts;
+      const account = target.social_accounts;
+
+      // Stand down permanently: the work is gone, the channel is gone, the page
+      // is locked, or the account can't publish at all. Clearing the stamp is
+      // what stops this row being reconsidered every five minutes forever.
+      const giveUp = (reason: string) => {
+        console.warn(`[cron] auto-retry abandoned for target ${target.id}: ${reason}`);
+        return supabase.from("post_targets").update({ auto_retry_at: null }).eq("id", target.id);
+      };
+
+      if (!post || !account) {
+        await giveUp(!post ? "its post no longer exists" : "its channel is no longer connected");
+        continue;
+      }
+      // Belt and braces against the double-post guard's own rule: a target
+      // holding an id reached the platform, whatever else went wrong.
+      if (target.external_post_id) {
+        await giveUp("it already carries a post id");
+        continue;
+      }
+      if (Date.now() - new Date(target.auto_retry_at).getTime() > AUTO_RETRY_GIVE_UP_MS) {
+        await giveUp("the failure is too old to re-send unattended");
+        continue;
+      }
+      if (isLocked(account)) {
+        await giveUp("the page is locked for posting");
+        continue;
+      }
+      try {
+        assertPublishable(account);
+      } catch (e: any) {
+        await giveUp(e.message);
+        continue;
+      }
+
+      // Did it actually publish while Postiz was failing to answer?
+      //
+      // Anchored on the FAILURE, which auto_retry_at encodes exactly (it was
+      // set to failure + AUTO_RETRY_DELAY_MS). created_at would be wrong here:
+      // that is when the target row was made, which for a post scheduled days
+      // ahead is nowhere near when the publish was attempted, and the lookup
+      // window would miss the post entirely — reading "not published" for one
+      // that was.
+      const failedAt = new Date(new Date(target.auto_retry_at).getTime() - AUTO_RETRY_DELAY_MS);
+      const existing = await findPostizPostByContent({
+        integrationId: account.external_account_id,
+        content: target.content_override?.body || post.body || "",
+        around: failedAt,
+      });
+
+      if (existing.found === null) {
+        // Inconclusive. Leave auto_retry_at exactly as it is so the next run
+        // asks again; the give-up window above is what bounds the loop.
+        deferred++;
+        continue;
+      }
+
+      if (existing.found) {
+        await supabase
+          .from("post_targets")
+          .update({
+            status: "sent",
+            external_post_id: existing.id,
+            permalink: existing.permalink || null,
+            sent_at: new Date().toISOString(),
+            last_error: null,
+            auto_retry_at: null,
+          })
+          .eq("id", target.id);
+        await this.refreshPostStatus(supabase, post.id);
+        adopted++;
+        await logActivity({
+          type: "post.published",
+          title: `Recovered a post Postiz published but never confirmed — ${account.display_name}`,
+          status: "warning",
+          meta: {
+            postId: post.id,
+            targetId: target.id,
+            externalPostId: existing.id,
+            note: "The publish call failed with a Postiz outage error, but the post was live. Adopted instead of re-sent.",
+          },
+        });
+        continue;
+      }
+
+      // Genuinely not published — re-send this one page.
+      attempted++;
+      await supabase
+        .from("post_targets")
+        .update({
+          status: "scheduled",
+          last_error: null,
+          sent_at: null,
+          auto_retry_at: null,
+          auto_retry_count: (target.auto_retry_count || 0) + 1,
+        })
+        .eq("id", target.id);
+
+      const fresh = [{ ...target, status: "scheduled", last_error: null, auto_retry_count: (target.auto_retry_count || 0) + 1 }];
+      const counts = await this.publisher.publishTargets(supabase, post, fresh, { context: "auto-retry" });
+      published += counts.published;
+      await this.refreshPostStatus(supabase, post.id);
+
+      await logActivity({
+        type: counts.published ? "post.published" : "post.failed",
+        title: counts.published
+          ? `Auto-retry sent ${account.display_name} after a Postiz outage`
+          : `Auto-retry failed again on ${account.display_name}`,
+        status: counts.published ? "info" : "error",
+        meta: { postId: post.id, targetId: target.id, attempt: (target.auto_retry_count || 0) + 1 },
+      });
+    }
+
+    if (attempted || adopted || deferred) {
+      console.log(
+        `[cron] postiz auto-retry: ${published} sent, ${adopted} adopted, ${deferred} deferred (inconclusive).`,
+      );
+    }
+    return { attempted, published, adopted, deferred };
+  }
+
   // Queue publisher — publishes due targets the FB native scheduler isn't handling.
   async publish(req: any) {
     this.authorize(req);
@@ -228,6 +403,11 @@ export class CronService {
     // retry risks double-posting to a live page. A visible failure lets a human
     // check the page and repost; a duplicate can't be taken back.
     await this.sweepStrandedTargets(supabase);
+
+    // Before the queue: a target waiting on an automatic re-send is work that
+    // is already overdue, and running it first means an outage recovery is not
+    // stuck behind the batch cap below.
+    const autoRetry = await this.retryPostizOutages(supabase);
 
     // Which posts actually have work? Ask the TARGETS first.
     //
@@ -255,7 +435,7 @@ export class CronService {
     if (readyError) throw new InternalServerErrorException(readyError.message);
 
     const readyPostIds = [...new Set((readyTargets || []).map((t: any) => t.post_id).filter(Boolean))];
-    if (!readyPostIds.length) return { due: 0, published: 0, failed: 0 };
+    if (!readyPostIds.length) return { due: 0, published: 0, failed: 0, autoRetry };
 
     // Recover posts orphaned mid-run. The loop below flips a post to
     // "publishing" BEFORE working through its targets, and that flip doubles as
@@ -368,7 +548,7 @@ export class CronService {
       }
     }
 
-    return { due: (due || []).length, published, failed };
+    return { due: (due || []).length, published, failed, autoRetry };
   }
 
   // Verify recent sent posts still exist on-platform.
